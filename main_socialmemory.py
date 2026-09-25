@@ -174,28 +174,50 @@ def _stop_camera_recording(proc, timeout: float = 15.0):
             proc.kill()
 
 
+# The GUI loops tick every 50 ms: that keeps the live sensor display current
+# and lets every window handle its events (move, resize, the door override
+# key) promptly. The performance plots, though, are only replotted when a
+# results table has gained rows — sessions only ever append rows, never edit
+# them, so an unchanged row count means an unchanged figure. On other ticks
+# the performance window just handles events (perf_gui.poll()).
+
+
 def _run_loop_training(session, shared, sensor_gui, perf_gui,
                        session_duration_s=None):
-    """Update GUIs every 50 ms while training session runs."""
+    """Update GUIs every 50 ms while training session runs.
+    sensor_gui is None when the live sensor display is turned off."""
     start = time.time()
+    last_rows = None   # None forces the first draw
     while session.running and not STOP_EVENT.is_set():
         if session_duration_s and (time.time() - start) >= session_duration_s:
             print(f"[INFO] Session duration ({session_duration_s} s) reached")
             STOP_EVENT.set()
             break
-        snap = shared.get()
-        sensor_gui.update(snap)
-        perf_gui.update(session.snapshot(session.results_df))
+        if sensor_gui is not None:
+            sensor_gui.update(shared.get())
+        rows = len(session.results_df)
+        if rows != last_rows:
+            perf_gui.update(session.snapshot(session.results_df))
+            last_rows = rows
+        else:
+            perf_gui.poll()
         time.sleep(0.05)
 
 
 def _run_loop_task(session, shared, sensor_gui, perf_gui):
-    """Update GUIs every 50 ms while task session runs."""
+    """Update GUIs every 50 ms while task session runs.
+    sensor_gui is None when the live sensor display is turned off."""
+    last_rows = None   # None forces the first draw (preloads the planned sequence)
     while session.running and not STOP_EVENT.is_set():
-        snap = shared.get()
-        sensor_gui.update(snap)
-        perf_gui.update(session.snapshot(session.presentations_df),
-                         session.snapshot(session.conditioning_df))
+        if sensor_gui is not None:
+            sensor_gui.update(shared.get())
+        rows = (len(session.presentations_df), len(session.conditioning_df))
+        if rows != last_rows:
+            perf_gui.update(session.snapshot(session.presentations_df),
+                             session.snapshot(session.conditioning_df))
+            last_rows = rows
+        else:
+            perf_gui.poll()
         time.sleep(0.05)
 
 
@@ -221,6 +243,9 @@ def main():
     port      = params["port"]
     baud      = params["baud"]
 
+    print(f"[INFO] Setup: {params.get('setup') or '(not set)'}  |  "
+          f"Treatment: {params.get('treatment_details') or 'none'}")
+
     from SocialMemory.training     import ClassicalConditioningSession, AutoRewardSession
     from SocialMemory.task         import SocialMemoryTaskSession
     from SocialMemory.passive_test import PassiveTestSession, generate_box_sequence, label_sequence
@@ -243,6 +268,12 @@ def main():
 
     params["date"]     = timestamp_str
     params["save_dir"] = BASE_SAVE_DIR
+    if species == "rat":
+        # Hard-coded, so recorded explicitly — sessions before these were
+        # lowered used 0.033 s / 2.0 s.
+        from SocialMemory.base_session import REWARD_INCREMENT_S, REWARD_MAX_VALVE_S
+        params["reward_increment_s"] = REWARD_INCREMENT_S
+        params["reward_max_valve_s"] = REWARD_MAX_VALVE_S
     _save_metadata(BASE_SAVE_DIR, params)
 
     sensor_log   = os.path.join(BASE_SAVE_DIR, "sensor_events.csv")
@@ -305,7 +336,14 @@ def main():
     print(f"[INFO] Camera sync-pulse log: {camera_sync_log}")
 
     # ── GUIs (task-related GUIs) ──────────────────────────────────────────────
-    sensor_gui = SensorGUI()
+    # The live sensor window is optional (setup GUI checkbox) — it only
+    # visualizes SharedSensorState; logging and the session's own state reads
+    # don't depend on it.
+    if params.get("show_sensor_display", True):
+        sensor_gui = SensorGUI()
+    else:
+        sensor_gui = None
+        print("[INFO] Live sensor display off (not checked in setup)")
     box_labels = None
     expected_periods = None
     passive_sequence = None
@@ -390,7 +428,8 @@ def main():
             )
             door_override = threading.Event()
             session.door_override = door_override
-            _bind_door_override(door_override, sensor_gui, perf_gui)
+            _bind_door_override(door_override,
+                                *[g for g in (sensor_gui, perf_gui) if g is not None])
             session.start()
             print(f"[INFO] Task started — Ctrl+C to stop "
                   f"(press '{DOOR_OVERRIDE_KEY}' with a GUI window focused to "
@@ -419,7 +458,8 @@ def main():
             )
             door_override = threading.Event()
             session.door_override = door_override
-            _bind_door_override(door_override, sensor_gui, perf_gui)
+            _bind_door_override(door_override,
+                                *[g for g in (sensor_gui, perf_gui) if g is not None])
             session.start()
             print(f"[INFO] Passive test started — Ctrl+C to stop "
                   f"(press '{DOOR_OVERRIDE_KEY}' with a GUI window focused to "
@@ -479,11 +519,13 @@ def main():
             except Exception as e:
                 print(f"[WARN] Home return failed: {e}")
 
-        sensor_gui.update(shared.get())
+        if sensor_gui is not None:
+            sensor_gui.update(shared.get())
         shutdown_outputs(device)
         device.disconnect()
         perf_gui.close(save_path=perf_fig)
-        sensor_gui.close()
+        if sensor_gui is not None:
+            sensor_gui.close()
         _stop_camera_recording(camera_proc)
         print("[INFO] Clean shutdown complete")
 

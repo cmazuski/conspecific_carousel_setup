@@ -25,7 +25,7 @@ import pandas as pd
 from hardware import (
     set_led, sensor_held, deliver_reward, incremental_reward, STOP_EVENT,
 )
-from .base_session import BaseSMSession
+from .base_session import BaseSMSession, REWARD_INCREMENT_S, REWARD_MAX_VALVE_S
 
 
 class ClassicalConditioningSession(BaseSMSession):
@@ -89,7 +89,9 @@ class ClassicalConditioningSession(BaseSMSession):
             vt = self.valve_times[port]
             if self._poked_ports.issuperset(self.ports):
                 valve_time = incremental_reward(
-                    self.ser, port, vt, self._increment_count)
+                    self.ser, port, vt, self._increment_count,
+                    increment=REWARD_INCREMENT_S,
+                    max_valve_time=REWARD_MAX_VALVE_S)
                 self._increment_count += 1
                 return valve_time
             deliver_reward(self.ser, port, vt)

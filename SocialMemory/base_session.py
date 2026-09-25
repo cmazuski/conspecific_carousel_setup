@@ -32,6 +32,13 @@ from hardware import (
     STOP_EVENT,
 )
 
+# Rat incremental reward, SocialMemory only (other families still use the
+# hardware.incremental_reward defaults of 0.033 s / 2.0 s). The valve time grows
+# by REWARD_INCREMENT_S per reward, capped at REWARD_MAX_VALVE_S — the cap also
+# applies to the base valve time itself.
+REWARD_INCREMENT_S = 0.015
+REWARD_MAX_VALVE_S = 1.0
+
 
 class BaseSMSession:
 
@@ -173,7 +180,9 @@ class BaseSMSession:
         """Deliver species-appropriate reward at port. Returns valve time used."""
         vt = self.valve_times[port]
         if self.species == "rat":
-            return incremental_reward(self.ser, port, vt, self.reward_count)
+            return incremental_reward(self.ser, port, vt, self.reward_count,
+                                      increment=REWARD_INCREMENT_S,
+                                      max_valve_time=REWARD_MAX_VALVE_S)
         deliver_reward(self.ser, port, vt)
         return vt
 

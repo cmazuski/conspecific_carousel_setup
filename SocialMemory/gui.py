@@ -216,6 +216,11 @@ class PerformanceGUI:
         self.fig.canvas.draw()
         self.fig.canvas.flush_events()
 
+    def poll(self):
+        """Handle pending window events (move, resize, key presses) without
+        replotting — for GUI-loop ticks where no new data has arrived."""
+        self.fig.canvas.flush_events()
+
     # ── Training mode ─────────────────────────────────────────────────────────
 
     def _update_training(self, df: pd.DataFrame):

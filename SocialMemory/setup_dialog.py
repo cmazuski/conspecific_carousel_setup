@@ -14,9 +14,14 @@ from tkinter import ttk, messagebox, filedialog
 from utils import parse_motor_speed
 from tk_window_helpers import make_scrollable, fit_window_to_screen
 from camera_select import CameraChooser
+from rig_setups import SETUPS, SETUP_CAMERAS
 
 _SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "last_settings.json")
+
+# How many recent values each free-text field (animal ID, COM port, stim IDs...)
+# offers in its dropdown. Kept in last_settings.json under "recent".
+HISTORY_LEN = 4
 
 SPECIES_DEFAULTS = {
     "rat": {
@@ -99,6 +104,11 @@ class SMSetupDialog:
         self._task_vars   = {}          # task-specific parameters
         self._passive_vars = {}         # passive-test-specific parameters
         self._speed_vars  = {}          # motor speed parameters
+        self._setup_var   = tk.StringVar(value="")
+        self._treatment_var = tk.BooleanVar(value=False)
+        self._sensor_display_var = tk.BooleanVar(value=True)
+        self._history        = {}       # history key -> recent values, newest first
+        self._history_combos = {}       # history key -> (Combobox, StringVar)
 
         self._training_frame = None
         self._task_frame     = None
@@ -119,6 +129,9 @@ class SMSetupDialog:
             "auto_reward": self._auto_reward_var.get(),
             "record_camera": self._camera.record,
             "camera_serial": self._camera.serial,
+            "setup": self._setup_var.get(),
+            "show_sensor_display": self._sensor_display_var.get(),
+            "recent": self._history,
         }
         for k, v in self._vars.items():
             s[k] = v.get()
@@ -160,6 +173,21 @@ class SMSetupDialog:
             self._camera.record = s["record_camera"]
         if "camera_serial" in s:
             self._camera.serial = s["camera_serial"]
+        # After camera_serial, so a setup with a linked camera wins over a
+        # stale saved serial.
+        if s.get("setup") in SETUPS:
+            self._setup_var.set(s["setup"])
+            self._on_setup_change()
+        if "show_sensor_display" in s:
+            self._sensor_display_var.set(s["show_sensor_display"])
+        # The treatment checkbox itself is deliberately not restored — it is
+        # per-session, and a stale tick would mislabel the next animal.
+        recent = s.get("recent")
+        if isinstance(recent, dict):
+            self._history = {k: [str(v) for v in vals][:HISTORY_LEN]
+                             for k, vals in recent.items() if isinstance(vals, list)}
+        for key, (combo, _var) in self._history_combos.items():
+            combo["values"] = self._history.get(key, [])
         for k, v in self._vars.items():
             if k in s:
                 v.set(s[k])
@@ -185,13 +213,31 @@ class SMSetupDialog:
             if f"passive_port_{port}" in s:
                 v.set(s[f"passive_port_{port}"])
 
+    def _update_history(self):
+        """Move each history field's current value to the front of its list."""
+        for key, (_combo, var) in self._history_combos.items():
+            val = var.get().strip()
+            items = [v for v in self._history.get(key, []) if v != val]
+            if val:
+                items.insert(0, val)
+            self._history[key] = items[:HISTORY_LEN]
+
     # ── Layout helpers ────────────────────────────────────────────────────────
 
-    def _row(self, parent, label_text, var, row, col=0, width=14):
+    def _entry(self, parent, var, width, history_key=None):
+        """A text entry, or — given a history_key — an editable dropdown of the
+        field's HISTORY_LEN most recent values (filled in on restore)."""
+        if history_key is None:
+            return tk.Entry(parent, textvariable=var, width=width)
+        combo = ttk.Combobox(parent, textvariable=var, width=width)
+        self._history_combos[history_key] = (combo, var)
+        return combo
+
+    def _row(self, parent, label_text, var, row, col=0, width=14, history_key=None):
         pad = {"padx": 6, "pady": 2}
         tk.Label(parent, text=label_text, anchor="w").grid(
             row=row, column=col, sticky="w", **pad)
-        tk.Entry(parent, textvariable=var, width=width).grid(
+        self._entry(parent, var, width, history_key).grid(
             row=row, column=col + 1, sticky="w", **pad)
 
     def _make_var(self, key, default=""):
@@ -209,29 +255,40 @@ class SMSetupDialog:
                  font=("Arial", 13, "bold")).grid(
             row=0, column=0, columnspan=4, pady=(12, 4))
 
+        # Setup — which physical rig this session runs on. Also selects that
+        # rig's camera (see rig_setups.SETUP_CAMERAS).
+        tk.Label(root, text="Setup:", anchor="w").grid(
+            row=1, column=0, sticky="w", **pad)
+        setup_combo = ttk.Combobox(root, textvariable=self._setup_var,
+                                   values=SETUPS, state="readonly", width=17)
+        setup_combo.grid(row=1, column=1, sticky="w", **pad)
+        setup_combo.bind("<<ComboboxSelected>>", self._on_setup_change)
+        self._setup_camera_label = tk.Label(root, text="", font=("Arial", 8), fg="gray")
+        self._setup_camera_label.grid(row=1, column=2, columnspan=2, sticky="w", **pad)
+
         # Species
         tk.Label(root, text="Species:", anchor="w").grid(
-            row=1, column=0, sticky="w", **pad)
+            row=2, column=0, sticky="w", **pad)
         sf = tk.Frame(root)
-        sf.grid(row=1, column=1, columnspan=3, sticky="w", **pad)
+        sf.grid(row=2, column=1, columnspan=3, sticky="w", **pad)
         for sp in ("Rat", "Mouse"):
             tk.Radiobutton(sf, text=sp, variable=self._species_var,
                            value=sp.lower(),
                            command=self._on_species_change).pack(side="left", padx=4)
 
         ttk.Separator(root, orient="horizontal").grid(
-            row=2, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
+            row=3, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
 
-        # Core fields
-        for i, (label, key, default) in enumerate([
-            ("Animal ID:",   "animal",    ""),
-            ("Session #:",   "session_n", "1"),
-            ("Serial Port:", "port",      "COM3"),
-            ("Baud Rate:",   "baud",      "115200"),
+        # Core fields (animal ID and port offer their recent values)
+        for i, (label, key, default, history_key) in enumerate([
+            ("Animal ID:",   "animal",    "",       "animal"),
+            ("Session #:",   "session_n", "1",      None),
+            ("Serial Port:", "port",      "COM3",   "port"),
+            ("Baud Rate:",   "baud",      "115200", None),
         ]):
             v = tk.StringVar(value=default)
             self._vars[key] = v
-            self._row(root, label, v, row=3 + i, width=20)
+            self._row(root, label, v, row=4 + i, width=20, history_key=history_key)
 
         # Save folder (with browse button) — session data (CSVs, metadata,
         # camera recording) is saved under <save_root>/<animal>_..._<datetime>/
@@ -239,20 +296,31 @@ class SMSetupDialog:
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "SocialMemoryData")
         self._vars["save_root"] = tk.StringVar(value=default_save_root)
         tk.Label(root, text="Save Folder:", anchor="w").grid(
-            row=7, column=0, sticky="w", **pad)
-        tk.Entry(root, textvariable=self._vars["save_root"], width=20).grid(
-            row=7, column=1, sticky="w", **pad)
+            row=8, column=0, sticky="w", **pad)
+        self._entry(root, self._vars["save_root"], 20, history_key="save_root").grid(
+            row=8, column=1, sticky="w", **pad)
         tk.Button(root, text="Browse...", command=self._browse_save_root).grid(
-            row=7, column=2, sticky="w", **pad)
+            row=8, column=2, sticky="w", **pad)
+
+        # Treatment — tick if the animal had one; describe it in the box.
+        tf = tk.Frame(root)
+        tf.grid(row=9, column=0, columnspan=4, sticky="w", **pad)
+        tk.Checkbutton(tf, text="Treatment:", variable=self._treatment_var,
+                       command=self._on_treatment_toggle).pack(side="left")
+        self._treatment_detail_var = tk.StringVar()
+        self._treatment_entry = self._entry(
+            tf, self._treatment_detail_var, 30, history_key="treatment")
+        self._treatment_entry.pack(side="left", padx=4)
+        self._on_treatment_toggle()
 
         ttk.Separator(root, orient="horizontal").grid(
-            row=8, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
+            row=10, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
 
         # Mode
         tk.Label(root, text="Mode:", anchor="w").grid(
-            row=9, column=0, sticky="w", **pad)
+            row=11, column=0, sticky="w", **pad)
         mf = tk.Frame(root)
-        mf.grid(row=9, column=1, columnspan=3, sticky="w", **pad)
+        mf.grid(row=11, column=1, columnspan=3, sticky="w", **pad)
         for label, value in (("Training", "training"), ("Task", "task"),
                               ("Passive Test", "passivetest")):
             tk.Radiobutton(mf, text=label, variable=self._mode_var,
@@ -260,11 +328,11 @@ class SMSetupDialog:
                            command=self._on_mode_change).pack(side="left", padx=4)
 
         ttk.Separator(root, orient="horizontal").grid(
-            row=10, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
+            row=12, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
 
         # ── Motor speeds (always visible) ─────────────────────────────────────
         speed_frame = tk.LabelFrame(root, text="Motor Speeds (0-255)", padx=8, pady=6)
-        speed_frame.grid(row=11, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
+        speed_frame.grid(row=13, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
         for i, (label, key) in enumerate([
             ("Door Open Speed:",  "door_open_speed"),
             ("Door Close Speed:", "door_close_speed"),
@@ -282,15 +350,27 @@ class SMSetupDialog:
         # The camera is chosen by serial number so a second session running in
         # another terminal can record the other camera at the same time.
         cam_frame = tk.LabelFrame(root, text="Camera", padx=8, pady=6)
-        cam_frame.grid(row=12, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
+        cam_frame.grid(row=14, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
         self._camera = CameraChooser(cam_frame)
         self._camera.grid(row=0, column=0, sticky="w")
+
+        # ── Live display ──────────────────────────────────────────────────────
+        disp_frame = tk.LabelFrame(root, text="Live Display", padx=8, pady=6)
+        disp_frame.grid(row=15, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
+        tk.Checkbutton(disp_frame, text="Show live sensor display",
+                       variable=self._sensor_display_var).grid(
+            row=0, column=0, sticky="w", padx=6)
+        tk.Label(disp_frame,
+                 text="(the small port/door/table window; turn off to save CPU — "
+                      "all sensor events are still logged)",
+                 font=("Arial", 8), fg="gray").grid(
+            row=1, column=0, sticky="w", padx=6)
 
         # ── Training frame ────────────────────────────────────────────────────
         self._training_frame = tk.LabelFrame(
             root, text="Training Parameters", padx=8, pady=6)
         self._training_frame.grid(
-            row=13, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
+            row=16, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
 
         # Port selection checkboxes
         tk.Label(self._training_frame, text="Ports:", anchor="w").grid(
@@ -348,7 +428,7 @@ class SMSetupDialog:
         self._task_frame = tk.LabelFrame(
             root, text="Task Parameters", padx=8, pady=6)
         self._task_frame.grid(
-            row=13, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
+            row=16, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
 
         # S1 sub-frame
         s1f = tk.LabelFrame(self._task_frame, text="S1 (familiar stimulus)",
@@ -368,7 +448,8 @@ class SMSetupDialog:
             ("ITI min (s):",      "s1_iti_min"),
             ("ITI max (s):",      "s1_iti_max"),
         ]):
-            self._row(s1f, label, self._task_vars[key], row=i, width=10)
+            self._row(s1f, label, self._task_vars[key], row=i, width=10,
+                      history_key="s1_id" if key == "s1_id" else None)
 
         # S2 sub-frame
         s2f = tk.LabelFrame(self._task_frame, text="S2 (novel stimulus)",
@@ -388,7 +469,8 @@ class SMSetupDialog:
             ("ITI min (s):",      "s2_iti_min"),
             ("ITI max (s):",      "s2_iti_max"),
         ]):
-            self._row(s2f, label, self._task_vars[key], row=i, width=10)
+            self._row(s2f, label, self._task_vars[key], row=i, width=10,
+                      history_key="s2_id" if key == "s2_id" else None)
 
         tk.Label(self._task_frame,
                  text="Box positions: 0 = home, 1 = 90° CW, 2 = 180°, 3 = 270° CW",
@@ -439,7 +521,7 @@ class SMSetupDialog:
         self._passive_frame = tk.LabelFrame(
             root, text="Passive Test Parameters", padx=8, pady=6)
         self._passive_frame.grid(
-            row=13, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
+            row=16, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
 
         # Box sub-frame: label + # presentations for each of the 4 boxes
         boxf = tk.LabelFrame(self._passive_frame, text="Boxes", padx=6, pady=4)
@@ -453,7 +535,8 @@ class SMSetupDialog:
             self._passive_vars[f"box{i}_n"]  = tk.StringVar()
             tk.Label(boxf, text=f"Box {i} ({angle}°):", anchor="w").grid(
                 row=1 + i, column=0, sticky="w", padx=6, pady=2)
-            tk.Entry(boxf, textvariable=self._passive_vars[f"box{i}_id"], width=16).grid(
+            self._entry(boxf, self._passive_vars[f"box{i}_id"], 16,
+                        history_key=f"passive_box{i}_id").grid(
                 row=1 + i, column=1, padx=6, pady=2)
             tk.Entry(boxf, textvariable=self._passive_vars[f"box{i}_n"], width=8).grid(
                 row=1 + i, column=2, padx=6, pady=2)
@@ -515,15 +598,15 @@ class SMSetupDialog:
 
         # ── Notes ─────────────────────────────────────────────────────────────
         ttk.Separator(root, orient="horizontal").grid(
-            row=14, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
+            row=17, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
         tk.Label(root, text="Notes:", anchor="w").grid(
-            row=15, column=0, sticky="nw", **pad)
+            row=18, column=0, sticky="nw", **pad)
         self._notes = tk.Text(root, width=40, height=3, font=("Arial", 9))
-        self._notes.grid(row=15, column=1, columnspan=3, sticky="ew", **pad)
+        self._notes.grid(row=18, column=1, columnspan=3, sticky="ew", **pad)
 
         # ── Buttons ───────────────────────────────────────────────────────────
         bf = tk.Frame(root)
-        bf.grid(row=16, column=0, columnspan=4, pady=(8, 14))
+        bf.grid(row=19, column=0, columnspan=4, pady=(8, 14))
         tk.Button(bf, text="Start Session", bg="#4CAF50", fg="white",
                   font=("Arial", 11, "bold"), width=18,
                   command=self._on_start).pack(side="left", padx=8)
@@ -578,6 +661,20 @@ class SMSetupDialog:
         for p in "ABC":
             self._passive_vars[f"valve_time_{p}"].set(str(d[f"valve_time_{p}"]))
 
+    def _on_setup_change(self, _event=None):
+        """Select the chosen setup's camera, if one is linked to it."""
+        serial = SETUP_CAMERAS.get(self._setup_var.get(), "")
+        if serial:
+            self._camera.serial = serial
+            self._setup_camera_label.config(text=f"camera {serial}")
+        else:
+            self._setup_camera_label.config(
+                text="no camera linked" if self._setup_var.get() else "")
+
+    def _on_treatment_toggle(self):
+        self._treatment_entry.config(
+            state="normal" if self._treatment_var.get() else "disabled")
+
     def _browse_save_root(self):
         chosen = filedialog.askdirectory(
             initialdir=self._vars["save_root"].get() or os.getcwd(),
@@ -614,6 +711,15 @@ class SMSetupDialog:
         save_root = self._vars["save_root"].get().strip()
         if not save_root:
             errors.append("Save folder is required.")
+
+        setup = self._setup_var.get()
+        if not setup:
+            errors.append("Select which setup this session runs on.")
+
+        treatment = self._treatment_var.get()
+        treatment_details = self._treatment_detail_var.get().strip() if treatment else ""
+        if treatment and not treatment_details:
+            errors.append("Treatment is ticked — describe the treatment.")
 
         try:
             baud = int(self._vars["baud"].get())
@@ -850,9 +956,26 @@ class SMSetupDialog:
                 "notes":           self._notes.get("1.0", "end").strip(),
             }
 
+        # A deliberate camera override is allowed, but confirm it: filming the
+        # neighbouring rig by mistake is only noticed after the session.
+        linked = SETUP_CAMERAS.get(setup, "")
+        if (self._camera.record and linked and self._camera.serial != linked
+                and not messagebox.askyesno(
+                    "Camera mismatch",
+                    f"{setup} is linked to camera {linked}, but camera "
+                    f"{self._camera.serial or '(auto)'} is selected.\n\n"
+                    f"Record from the selected camera anyway?")):
+            self.result = None
+            return
+
+        self.result["setup"]              = setup
+        self.result["treatment"]          = treatment
+        self.result["treatment_details"]  = treatment_details
         self.result["record_camera"] = self._camera.record
         self.result["camera_serial"] = self._camera.serial
+        self.result["show_sensor_display"] = self._sensor_display_var.get()
 
+        self._update_history()
         self._save_settings()
         self.root.destroy()
 

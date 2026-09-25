@@ -205,6 +205,13 @@ These encode failures already debugged on the rig — preserve them.
   dialog module. (The dialogs' default `save_root` is still the repo root, not the family folder.)
   Adding a field means adding it to both the save and the restore path; these files are
   per-PC operator state (gitignored), not configuration to depend on.
+- **SocialMemory is the pilot for dialog features** that will later be ported to the other
+  families: a required **Setup** dropdown (`rig_setups.SETUPS`) that auto-selects the rig's camera
+  from the hard-coded `rig_setups.SETUP_CAMERAS`, a **Treatment** checkbox + description (both go
+  into `metadata.json` as `setup` / `treatment` / `treatment_details`), dropdowns of the 4 most
+  recent values for free-text fields (`"recent"` in `last_settings.json`), and a **Show live
+  sensor display** checkbox — off means `SensorGUI` is never created and `shared.get()` is not
+  polled; logging is unaffected.
 - **Species changes behavior.** `rat` gets `incremental_reward` (valve time grows with reward
   count, capped); `mouse` gets a fixed `deliver_reward`. Setup dialogs carry separate
   `SPECIES_DEFAULTS`.
