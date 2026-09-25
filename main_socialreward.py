@@ -1,178 +1,278 @@
 # main_socialreward.py
-import serial
-import queue
-import argparse
+# Unified entry point for rat and mouse social reward training.
+# Run from the project root: python main_socialreward.py
+#
+# A setup GUI will open first to collect all session parameters.
+# Parameters are saved as metadata.json in the session output folder.
+#
+# Phases:
+#   1    — autoshaping (port C LED, poke, reward)
+#   2    — door opens automatically, sensory minimum, port C, poke
+#   3a   — port A LED → poke → door opens → sensory minimum → port C → poke
+#   3b   — port A LED → poke → door opens → gradual sensory minimum → port C → poke
+#   4    — port A LED → poke → door opens → sensory minimum → port C within decision window
+#   task — full social-reward task (rewarded / unrewarded table positions)
+
 import time
 import signal
 import os
+import json
 from datetime import datetime
-from hardware import SharedSensorState, SerialReader, SerialProcessor, STOP_EVENT, shutdown_outputs
-from gui import SensorGUI, PerformanceGUI
-from SocialRewardRat.phase1 import Phase1Session
-from SocialRewardRat.phase234 import SocialRewardSession
-from SocialRewardRat.social_task import SocialTestSession
 
-"""All phases of social reward training in one script 
+from serial_comm import DeviceConnection
+from hardware import (
+    SharedSensorState, EventLogger, STOP_EVENT, shutdown_outputs,
+    turn_table_degrees, apply_motor_speeds,
+)
+from SocialReward.setup_dialog import SetupDialog
 
-# Phase 2: door automatically opens -> rat holds table sensor for 100 ms -> port C LED -> rat pokes -> reward
-# Phase 3a: port A LED -> rat pokes -> door opens -> rat hold table sensor for 100 ms -> port C LED -> rat pokes -> reward
-# Phase 3b: port A LED -> rat pokes -> door opens -> rat hold table sensor for 100-2000 ms -> port C LED -> rat pokes -> reward
-# Phase 4: port A LED -> rat pokes -> door opens -> rat hold table sensor for 100 ms -> port C LED -> rat pokes within 5 s -> reward
 
-"""
-
-valve_time = 0.3 # <- Change based on calibration, aim for 20 ul per poke
-
-def handle_sigint(sig, frame):
+def handle_sigint(_sig, _frame):
     STOP_EVENT.set()
     print("[INFO] Stopping...")
+
+
 signal.signal(signal.SIGINT, handle_sigint)
 
-def main():
-    # --- Base folder for all outputs ---
-    animal = input("Enter animal name/ID: ").strip() or "unknown"
-    session_n = input("Enter session number for the animal today: ").strip() or "1"
-    phase = input("Which phase? (1/2/3/4/task): ").strip()
-    date_str = datetime.now().strftime("%Y-%m-%d")
 
-    BASE_SAVE_DIR = os.path.join("SocialRewardData", f"{animal}_{session_n}_{phase}_{date_str}")
+def _build_gradual_hold(thresholds, holds):
+    """Return a callable that maps trial count → sensory minimum for phase 3b."""
+    def gradual_hold(session):
+        trial = session.trial_counter
+        for threshold, hold in zip(thresholds, holds[:-1]):
+            if trial < threshold:
+                return hold
+        return holds[-1]
+    return gradual_hold
+
+
+def _save_metadata(save_dir, params):
+    meta = dict(params)
+    meta["timestamp"] = datetime.now().isoformat()
+    path = os.path.join(save_dir, "metadata.json")
+    with open(path, "w") as f:
+        json.dump(meta, f, indent=2)
+    print(f"[INFO] Metadata saved: {path}")
+
+
+def _run_loop(session, shared, sensor_gui, perf_gui):
+    """Poll GUIs while the session runs. Trial/time limits are enforced inside the session."""
+    while session.running and not STOP_EVENT.is_set():
+        snap = shared.get()
+        sensor_gui.update(snap)
+        planned = getattr(session, "planned_sequence", None)
+        perf_gui.update(session.snapshot(session.results_df),
+                        current_trial_port="C",
+                        planned_sequence=planned)
+        time.sleep(0.05)
+
+
+def main():
+    # ── Setup GUI ─────────────────────────────────────────────────────────────
+    dialog = SetupDialog()
+    params = dialog.run()
+
+    if params is None:
+        print("[INFO] Setup cancelled.")
+        return
+
+    species = params["species"]
+    animal = params["animal"]
+    session_n = params["session_n"]
+    phase = params["phase"]
+    port = params["port"]
+    baud = params["baud"]
+    valve_time = params["valve_time"]
+    session_duration_s = params["session_duration_s"]        # may be None
+    session_duration_trials = params["session_duration_trials"]  # may be None
+    sensory_minimum_simple = params.get("sensory_minimum", 0.100)  # phases 2 and 3a
+    phase4_sensory_min = params["phase4_sensory_min"]
+    phase4_decision_window = params["phase4_decision_window"]
+    task_sensory_min      = params["task_sensory_min"]
+    task_decision_window  = params["task_decision_window"]
+    task_rewarded_angle   = params["task_rewarded_angle"]
+    task_unrewarded_angle = params["task_unrewarded_angle"]
+    stim4_config          = params.get("stim4_config")
+    phase3b_thresholds = params["phase3b_thresholds"]
+    phase3b_holds = params["phase3b_holds"]
+
+    # ── Output directory + metadata ───────────────────────────────────────────
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    BASE_SAVE_DIR = os.path.join(
+        "SocialRewardData",
+        f"{animal}_{session_n}_{phase}_{date_str}_{species}",
+    )
     os.makedirs(BASE_SAVE_DIR, exist_ok=True)
     print(f"[INFO] Saving all files to: {BASE_SAVE_DIR}")
 
+    params["date"] = date_str
+    params["save_dir"] = BASE_SAVE_DIR
+    _save_metadata(BASE_SAVE_DIR, params)
+
     trial_csv = os.path.join(BASE_SAVE_DIR, "trials.csv")
     sensor_log = os.path.join(BASE_SAVE_DIR, "sensor_events.csv")
-
     perf_fig_path = os.path.join(BASE_SAVE_DIR, "performance.png")
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", required=True)
-    parser.add_argument("--baud", type=int, default=57600)
-    args = parser.parse_args()
+    # ── Imports ───────────────────────────────────────────────────────────────
+    from SocialReward.Phase1 import Phase1Session
+    from SocialReward.Phase2 import Phase2Session
+    from SocialReward.Phase3 import Phase3Session
+    from SocialReward.Phase4 import Phase4Session
+    from SocialReward.Task import SocialTaskSession
+    from SocialReward.gui import SensorGUI, PerformanceGUI
 
-    # Initialise serial
+    # ── Connect to device ─────────────────────────────────────────────────────
     try:
-        ser = serial.Serial(args.port, baudrate=args.baud, timeout=0.05)
+        device = DeviceConnection(port, baudrate=baud)
+        device.connect()
         time.sleep(2)
     except Exception as e:
-        print(f"Cannot open serial: {e}")
+        print(f"Cannot open serial port: {e}")
         return
 
-    # # Shared state + listener + GUI (for all phases)
-    # shared = SharedSensorState()
-    # listener = SerialListener(
-    #     ser,
-    #     shared,
-    #     event_log_path=sensor_log,
-    # )
-    # listener.start()
-
-    shared = SharedSensorState()
-    q = queue.Queue()
-
-    reader = SerialReader(ser, q)
-    processor = SerialProcessor(
-        q,
-        shared,
-        event_log_path=sensor_log
+    apply_motor_speeds(
+        device,
+        door_open_speed=params.get("door_open_speed"),
+        door_close_speed=params.get("door_close_speed"),
+        table_speed=params.get("table_speed"),
     )
 
-    reader.start()
-    processor.start()
+    # ── Shared state + event logger ───────────────────────────────────────────
+    shared = SharedSensorState()
+    session_start = time.time()
 
+    logger = EventLogger(
+        shared,
+        event_log_path=sensor_log,
+        session_start=session_start,
+    )
+    device.on_event(logger)
+
+    # Surface serial faults. Without this every ACK timeout and every reader-thread
+    # death is discarded silently — and a dead reader means no sensor events ever
+    # arrive again, so the session blocks on device state with nothing printed.
+    def _on_serial_error(msg):
+        print(f"[ERROR] Serial: {msg}")
+
+    device.on_error(_on_serial_error)
+
+    # ── GUIs ──────────────────────────────────────────────────────────────────
     sensor_gui = SensorGUI()
     perf_gui = PerformanceGUI(animal_name=animal, phase_selection=phase)
 
     session = None
 
-    # --------------------------
-    # RUN TRIALS
-    # --------------------------
-
+    # ── Run trials ────────────────────────────────────────────────────────────
     try:
         if phase == "1":
             session = Phase1Session(
-                ser,
+                device,
                 shared,
-                save_dir=BASE_SAVE_DIR,
-                animal_name=animal,
+                species=species,
                 valve_time=valve_time,
-                session_duration=3600  # 1 hr
+                session_duration=session_duration_s,
             )
+            session.max_trials = session_duration_trials
             session.start()
             print("[INFO] Phase 1 running — press Ctrl+C to stop")
-
-            # GUI update
-            while session.running and not STOP_EVENT.is_set():
-                snap = shared.get()
-                sensor_gui.update(snap)
-                perf_gui.update(session.results_df, current_trial_port="C")
-                time.sleep(0.05)
-
+            _run_loop(session, shared, sensor_gui, perf_gui)
             print("[INFO] Phase 1 session finished")
 
-        elif phase in ("2", "3", "4"):
-            if phase == "2":
-                table_hold = 0.100
-                led_time = None
-                require_port_a = False
-            elif phase == "3": #removed 3a and 3b and combined them into one phase 
-                def gradual_hold(session):
-                    trial = session.trial_counter
-                    if trial < 15:
-                        return 0.2 # seconds
-                    elif trial < 30:
-                        return 0.5
-                    elif trial < 45:
-                        return 1.0
-                    elif trial < 60:
-                        return 1.5
-                    else:
-                        return 2.0
-                table_hold = gradual_hold
-                led_time = None  # unlimited time
-                require_port_a = True
-            else: # phase 4
-                table_hold = 2  # seconds
-                led_time = 5  # seconds
-                require_port_a = True
-
-            session = SocialRewardSession(
-                ser,
+        elif phase == "2":
+            session = Phase2Session(
+                device,
                 shared,
-                table_hold=table_hold,
-                led_on_time= led_time,  # unlimited time
-                require_port_a=require_port_a,
+                species=species,
+                sensory_minimum=sensory_minimum_simple,
                 valve_time=valve_time,
-                session_duration=3600  # 1 hour
+                session_duration=session_duration_s,
             )
+            session.max_trials = session_duration_trials
+            print("[INFO] Phase 2 running — press Ctrl+C to stop")
+            session.start()
+            _run_loop(session, shared, sensor_gui, perf_gui)
+
+        elif phase in ("3a", "3b"):
+            sensory_minimum = (
+                _build_gradual_hold(phase3b_thresholds, phase3b_holds)
+                if phase == "3b"
+                else sensory_minimum_simple
+            )
+            session = Phase3Session(
+                device,
+                shared,
+                species=species,
+                sensory_minimum=sensory_minimum,
+                valve_time=valve_time,
+                session_duration=session_duration_s,
+            )
+            session.max_trials = session_duration_trials
             print(f"[INFO] Phase {phase} running — press Ctrl+C to stop")
             session.start()
+            _run_loop(session, shared, sensor_gui, perf_gui)
 
-            # GUI update loop
-            while session.running and not STOP_EVENT.is_set():
-                snap = shared.get()
-                sensor_gui.update(snap)
-                perf_gui.update(session.results_df, current_trial_port="C")
-                time.sleep(0.05)
-        
-        elif phase == "task":
-            session = SocialTestSession(
-                ser,
+        elif phase == "4":
+            session = Phase4Session(
+                device,
                 shared,
+                species=species,
+                sensory_minimum=phase4_sensory_min,
+                decision_window=phase4_decision_window,
                 valve_time=valve_time,
-                session_duration=5400
+                session_duration=session_duration_s,
             )
-
+            session.max_trials = session_duration_trials
+            print("[INFO] Phase 4 running — press Ctrl+C to stop")
             session.start()
+            _run_loop(session, shared, sensor_gui, perf_gui)
 
-            while session.running and not STOP_EVENT.is_set():
-                snap = shared.get()
-                sensor_gui.update(snap)
-                perf_gui.update(session.results_df, current_trial_port="C")
-                time.sleep(0.05)
+        elif phase == "task":
+            session = SocialTaskSession(
+                device,
+                shared,
+                species=species,
+                valve_time=valve_time,
+                sensory_minimum=task_sensory_min,
+                decision_window=task_decision_window,
+                rewarded_angle=task_rewarded_angle,
+                unrewarded_angle=task_unrewarded_angle,
+                session_duration=session_duration_s,
+            )
+            session.max_trials = session_duration_trials
+            session.start()
+            # Wait briefly for _run_session to pre-generate planned_sequence
+            time.sleep(0.1)
+            perf_gui.draw_plan(session.planned_sequence,
+                               rewarded_angle=task_rewarded_angle)
+            _run_loop(session, shared, sensor_gui, perf_gui)
+
+        elif phase == "4stimuli":
+            if stim4_config is None:
+                print("[ERROR] 4stimuli config missing — check setup GUI.")
+                return
+            from SocialReward.Phase4Stimuli import Phase4StimuliSession
+            session = Phase4StimuliSession(
+                device,
+                shared,
+                species=species,
+                valve_time=valve_time,
+                box_config=stim4_config["box_config"],
+                sensory_minimum=stim4_config["sensory_min"],
+                decision_window=stim4_config["decision_win"],
+                session_duration=session_duration_s,
+            )
+            session.max_trials = session_duration_trials
+            session.start()
+            time.sleep(0.1)
+            # Build rewarded_angle from the first rewarded box for label colouring
+            rewarded_boxes = [b for b, cfg in stim4_config["box_config"].items()
+                              if cfg["rewarded"]]
+            rewarded_angle = rewarded_boxes[0] * 90 if rewarded_boxes else None
+            perf_gui.draw_plan(session.planned_sequence, rewarded_angle=rewarded_angle)
+            _run_loop(session, shared, sensor_gui, perf_gui)
 
         else:
-            print("Invalid phase selection")
+            print(f"[ERROR] Unknown phase: {phase}")
 
     finally:
         print("Shutting down...")
@@ -181,15 +281,43 @@ def main():
             session.stop()
             session.results_df.to_csv(trial_csv, index=False)
             print(f"[INFO] Trials saved: {trial_csv}")
-        #listener.join(timeout=1)
-        reader.join(timeout=1)
-        processor.join(timeout=1)
 
-        shutdown_outputs(ser)
-        ser.close()
+        # Return turntable to box 0 (home) before powering down.
+        # Raw polling loops are used throughout so STOP_EVENT doesn't abort the moves.
+        if phase == "task" and session is not None:
+            try:
+                def _poll_until_stopped(timeout=20.0):
+                    time.sleep(1.0)   # grace period for motor-start firmware event
+                    deadline = time.time() + timeout
+                    while time.time() < deadline:
+                        state, _ = shared.get_port("table_motor")
+                        if state != "table moving":
+                            return
+                        time.sleep(0.05)
+
+                # Step 1: let any in-progress move (e.g. killed mid-turn) finish
+                print("[INFO] Waiting for any in-progress table move to complete...")
+                _poll_until_stopped()
+
+                # Step 2: send home command (negate delta — firmware positive = physical CCW)
+                current = getattr(session, "_current_angle", 0)
+                delta = (0 - current) % 360
+                if delta > 180:
+                    delta -= 360
+                if delta != 0:
+                    print(f"[INFO] Returning turntable to box 0 from logical {current}°...")
+                    turn_table_degrees(device, -delta)
+                    _poll_until_stopped()
+                print("[INFO] Turntable at home")
+            except Exception as e:
+                print(f"[WARN] Home return failed: {e}")
+
+        shutdown_outputs(device)
+        device.disconnect()
         perf_gui.close(save_path=perf_fig_path)
         sensor_gui.close()
         print("[INFO] Clean shutdown complete")
+
 
 if __name__ == "__main__":
     main()

@@ -1,111 +1,105 @@
 #!/usr/bin/env python3
 """
-Water calibration script for a single port.
+Water calibration script for a single port (new firmware).
 
-0) Make sure water flow is smooth/port is flushed
-1) Send 1-s pulses x 10, so total flow duration = 10 s
-2) User input flow volume (ml)
-3) Calculate flow rate (ml per s) = volume/total duration
-4) Return 0.001/flow rate = pulse duration (s) to set for this port so that 1 pulse/"drop" is 1 ul
-
-Usage:
-    python water_cal.py --port COM3
+1) Send a 10 s flush x1
+2) Record end volume and calculate change; user inputs flow volume (ml)
+3) Calculate flow rate (ml per s) = volume / total flow duration
+4) Return 0.001 / flow_rate = pulse duration (s) for 1 ul per pulse
 """
 
 import argparse
 import time
 import serial
 
-COMMANDS = {
-    "A": {
-        "led_on":  0x21,
-        "led_off": 0x22,
-        "valve_on": 0x23,
-        "valve_off": 0x24,
-    },
-    "B": {
-        "led_on":  0x25,
-        "led_off": 0x26,
-        "valve_on": 0x27,
-        "valve_off": 0x28,
-    },
-    "C": {
-        "led_on":  0x29,
-        "led_off": 0x2A,
-        "valve_on": 0x2B,
-        "valve_off": 0x2C,
-    },
+from protocol import (
+    MSG_WRITE,
+    REG_PA_LED, REG_PA_VALVE,
+    REG_PB_LED, REG_PB_VALVE,
+    REG_PC_LED, REG_PC_VALVE,
+    build_packet,
+)
+
+PORT_REGISTERS = {
+    "A": (REG_PA_LED, REG_PA_VALVE),
+    "B": (REG_PB_LED, REG_PB_VALVE),
+    "C": (REG_PC_LED, REG_PC_VALVE),
 }
 
-def flush(ser: serial.Serial, port: str, time_s: float = 10, n: int = 1) -> float:
-    
-    port = port.upper()
-    if port not in COMMANDS:
-        raise ValueError(f"Invalid port. Must be A, B, or C.")
 
-    cmds = COMMANDS[port]
-
-    # LED ON
-    ser.write(bytes([cmds["led_on"]]))
+def _send(ser: serial.Serial, register: int, value: int) -> None:
+    ser.write(build_packet(register, MSG_WRITE, value))
     ser.flush()
+
+
+def flush(ser: serial.Serial, port: str, time_s: float = 10, n: int = 1) -> float:
+    port = port.upper()
+    if port not in PORT_REGISTERS:
+        raise ValueError("Invalid port. Must be A, B, or C.")
+
+    reg_led, reg_valve = PORT_REGISTERS[port]
+
+    _send(ser, reg_led, 1)
     time.sleep(0.1)
 
     for _ in range(n):
-        ser.write(bytes([cmds["valve_on"]]))
-        ser.flush()
+        _send(ser, reg_valve, 1)
         time.sleep(time_s)
-        ser.write(bytes([cmds["valve_off"]]))
-        ser.flush()
+        _send(ser, reg_valve, 0)
         time.sleep(0.1)
 
-    # LED OFF
-    ser.write(bytes([cmds["led_off"]]))
-    ser.flush()
+    _send(ser, reg_led, 0)
 
-    total_flow_duration = time_s * n
-    return total_flow_duration
+    return time_s * n
 
-def main():
-    parser = argparse.ArgumentParser(description="Water calibration script")
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Water calibration script (new firmware)")
     parser.add_argument("--port", required=True, help="Serial COM port (e.g., COM3)")
+    parser.add_argument("--baud", type=int, default=115200, help="Baud rate (default: 115200)")
     args = parser.parse_args()
 
-    # Open serial port
     try:
-        ser = serial.Serial(port=args.port, baudrate=9600, timeout=0.2)
-        print(f"Serial port open.")
+        ser = serial.Serial(port=args.port, baudrate=args.baud, timeout=0.2)
+        print("Serial port open.")
     except Exception as e:
         print(f"[ERROR] Could not open port {args.port}: {e}")
         return
 
-    # Ask for flush port (A/B/C)
+    time.sleep(2.0)
+
     port = input("Enter flush port (A/B/C): ").strip().upper()
-    if port not in ["A", "B", "C"]:
+    if port not in PORT_REGISTERS:
         print("[ERROR] Invalid port. Must be A, B, or C.")
         ser.close()
         return
 
+    start_ml = float(input("Enter START volume (ml): ").strip())
+
     try:
-        # Send 1-second pulses x 10
+        print("Flowing... (10 s)")
         total_flow_duration = flush(ser, port, time_s=10, n=1)
         print(f"Total flow duration: {total_flow_duration:.2f} s")
 
-        # User input flow volume (ml)
-        water_ml = float(input("Enter volume collected (ml): ").strip())
+        end_ml = float(input("Enter END volume (ml): ").strip())
+        water_ml = start_ml - end_ml
 
-        # Calculate flow rate in (ml per s)
+        if water_ml <= 0:
+            print("[ERROR] End volume must be smaller than start volume.")
+            return
+
+        print(f"Flow volume: {water_ml:.3f} ml")
         flow_rate = water_ml / total_flow_duration
         print(f"Flow rate: {flow_rate:.3f} ml/s")
-
-        # Print pulse duration for 1 ul
-        duration_per_ml = 0.001 / flow_rate
-        print(f"Pulse duration per 1 ul for port {port}: {duration_per_ml:.3f} s")
+        duration_per_ul = 0.001 / flow_rate
+        print(f"Pulse duration per 1 ul for port {port}: {duration_per_ul:.6f} s")
 
     except Exception as e:
         print(f"[ERROR] {e}")
     finally:
         ser.close()
         print("Serial port closed.")
+
 
 if __name__ == "__main__":
     main()

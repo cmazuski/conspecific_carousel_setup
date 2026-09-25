@@ -6,15 +6,22 @@ venv/
 
 .idea/
 
-# Data outputs
+# Archived legacy code and data awaiting copy/deletion — local only
+_archive/
+
+# Data outputs — session folders for every task family (SocialMemoryData/,
+# SocialReward2AFCData/, SocialChoiceData/, ...), standalone camera recordings,
+# and any stray result files
+*Data/
 SocialRewardDATA
-SocialReward2AFCData/
 data/
+recording/
 *.csv
 *.png
+*.mp4
+*.ffmpeg.log
 
 # OS
 .DS_Store
 Thumbs.db
-recording/
-conspecific_carousel_firmware_update/socialmemory_last_settings.json
+SocialMemory/last_settings.json
