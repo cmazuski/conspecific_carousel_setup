@@ -30,6 +30,17 @@ REG_PC_LED = 0x27
 REG_PC_VALVE = 0x28
 REG_PC_IR = 0x29
 
+# Buzzer (PWM on firmware pin 7). Only in newer firmware builds — older ones
+# won't ACK these writes, so they're deliberately not in READABLE_REGISTERS.
+REG_BZR_EN = 0x30
+REG_BZR_FREQ = 0x31
+
+# The firmware multiplies the frequency register by this to get Hz (buzzer.py),
+# so values 1-255 give 20-5100 Hz. 0 would ask the PWM for 0 Hz — don't send it.
+BUZZER_HZ_PER_UNIT = 20
+BUZZER_FREQ_MIN = 1
+BUZZER_FREQ_MAX = 255
+
 REGISTER_NAMES = {
     REG_LED_SYNC: "LED/Sync",
     REG_DOOR_SENSOR: "Door Sensor",
@@ -52,6 +63,8 @@ REGISTER_NAMES = {
     REG_PC_LED: "Port C LED",
     REG_PC_VALVE: "Port C Valve",
     REG_PC_IR: "Port C IR",
+    REG_BZR_EN: "Buzzer",
+    REG_BZR_FREQ: "Buzzer Frequency",
 }
 
 DOOR_STATUS_MAP = {0: "Closed", 1: "Opened", 2: "Moving", 3: "Paused"}
@@ -90,8 +103,10 @@ def format_value(register, value):
     if register in (REG_DOOR_SENSOR, REG_TABLE_SENSOR, REG_PA_IR, REG_PB_IR, REG_PC_IR):
         return "Detected" if value else "Clear"
     if register in (REG_LED_SYNC, REG_PA_LED, REG_PB_LED, REG_PC_LED,
-                    REG_PA_VALVE, REG_PB_VALVE, REG_PC_VALVE):
+                    REG_PA_VALVE, REG_PB_VALVE, REG_PC_VALVE, REG_BZR_EN):
         return "On" if value else "Off"
+    if register == REG_BZR_FREQ:
+        return f"{value * BUZZER_HZ_PER_UNIT} Hz"
     return f"0x{value:02X}"
 
 

@@ -2,7 +2,8 @@
 """
 Setup control GUI for conspecific carousel (new firmware).
 Provides buttons for all basic device commands:
-  LEDs A/B/C, reward valves A/B/C, door open/close, turntable 90° CW/CCW.
+  LEDs A/B/C, reward valves A/B/C, door open/close, turntable 90° CW/CCW,
+  buzzer (frequency, on/off, timed beep).
 """
 
 import threading
@@ -16,6 +17,8 @@ from protocol import (
     REG_PC_LED, REG_PC_VALVE,
     REG_DOOR_CMD, REG_TABLE_CMD,
     REG_DOOR_OPN_SPD, REG_DOOR_CLS_SPD, REG_TABLE_SPD,
+    REG_BZR_EN, REG_BZR_FREQ,
+    BUZZER_HZ_PER_UNIT, BUZZER_FREQ_MIN, BUZZER_FREQ_MAX,
     build_table_command,
     reg_name, format_value,
 )
@@ -32,6 +35,15 @@ TABLE_90_CCW = build_table_command(1, 2)
 DOOR_OPEN_SPEED_DEFAULT = 255
 DOOR_CLOSE_SPEED_DEFAULT = 40
 TABLE_SPEED_DEFAULT = 40
+
+# Buzzer frequency register default: 50 x 20 = 1000 Hz, the firmware's own
+# power-on frequency.
+BUZZER_FREQ_DEFAULT = 50
+
+# Beep duration limits (ms). Every beep switches itself off; the cap stops a
+# typo from leaving the buzzer on for minutes.
+BEEP_MIN_MS = 10
+BEEP_MAX_MS = 10000
 
 
 class App(tk.Tk):
@@ -152,9 +164,53 @@ class App(tk.Tk):
                   font=("Arial", 8), foreground="gray").grid(
             row=len(speed_defs), column=0, columnspan=4, sticky="w", padx=6, pady=(0, 2))
 
+        # Buzzer
+        buzzer_frame = ttk.LabelFrame(body, text="Buzzer")
+        buzzer_frame.grid(row=4, column=0, columnspan=2, sticky="ew", **pad)
+
+        ttk.Label(buzzer_frame, text="Frequency", width=10).grid(row=0, column=0, **pad)
+        self.buzzer_freq_var = tk.IntVar(value=BUZZER_FREQ_DEFAULT)
+        buzzer_hz_lbl = ttk.Label(buzzer_frame, width=8,
+                                  text=f"{BUZZER_FREQ_DEFAULT * BUZZER_HZ_PER_UNIT} Hz")
+
+        def _on_buzzer_move(raw_value):
+            iv = round(float(raw_value))
+            self.buzzer_freq_var.set(iv)
+            buzzer_hz_lbl.config(text=f"{iv * BUZZER_HZ_PER_UNIT} Hz")
+
+        buzzer_scale = ttk.Scale(buzzer_frame, from_=BUZZER_FREQ_MIN, to=BUZZER_FREQ_MAX,
+                                 orient="horizontal", length=200, command=_on_buzzer_move)
+        buzzer_scale.set(BUZZER_FREQ_DEFAULT)
+        buzzer_scale.grid(row=0, column=1, columnspan=3, **pad)
+        buzzer_hz_lbl.grid(row=0, column=4, **pad)
+
+        # Only timed beeps — there is deliberately no plain "On", so the
+        # buzzer can't be left sounding. Frequency is sent with each beep.
+        ttk.Label(buzzer_frame, text="Duration (ms):").grid(row=1, column=0, columnspan=2, **pad)
+        self.beep_dur_var = tk.IntVar(value=500)
+        ttk.Spinbox(buzzer_frame, from_=BEEP_MIN_MS, to=BEEP_MAX_MS, increment=50,
+                    textvariable=self.beep_dur_var, width=7).grid(row=1, column=2, **pad)
+        ttk.Button(buzzer_frame, text="Beep", width=8,
+                   command=self._buzzer_beep).grid(row=1, column=3, **pad)
+        ttk.Button(buzzer_frame, text="Stop", width=8,
+                   command=self._buzzer_stop).grid(row=1, column=4, **pad)
+
+        ttk.Label(buzzer_frame,
+                  text="Needs firmware with buzzer support (registers 0x30/0x31) — "
+                       "older builds won't ACK.",
+                  font=("Arial", 8), foreground="gray").grid(
+            row=2, column=0, columnspan=5, sticky="w", padx=6, pady=(0, 2))
+        # Set once a beep has been sent, so disconnect/close only sends a
+        # buzzer-off to firmware that has one.
+        self._buzzer_used = False
+        # Incremented by every Beep/Stop; a beep only switches the buzzer off
+        # if it is still the latest, so a new beep isn't cut short by an old one.
+        self._beep_id = 0
+        self._beep_lock = threading.Lock()
+
         # Log
         log_frame = ttk.LabelFrame(body, text="Log")
-        log_frame.grid(row=4, column=0, columnspan=2, sticky="ew", **pad)
+        log_frame.grid(row=5, column=0, columnspan=2, sticky="ew", **pad)
 
         self.log_text = tk.Text(log_frame, height=10, width=62, state="disabled", font=("Courier", 9))
         self.log_text.grid(row=0, column=0, **pad)
@@ -196,6 +252,7 @@ class App(tk.Tk):
             messagebox.showerror("Connection Error", str(e))
 
     def _disconnect(self):
+        self._silence_buzzer()
         if self.conn:
             self.conn.disconnect()
             self.conn = None
@@ -246,6 +303,61 @@ class App(tk.Tk):
 
         threading.Thread(target=pulse, daemon=True).start()
 
+    def _buzzer_beep(self) -> None:
+        """Sound the buzzer at the slider's frequency for the set duration,
+        then switch it off."""
+        if not self.conn or not self.conn.is_connected:
+            self._log("[WARN] Not connected")
+            return
+        try:
+            duration_ms = int(self.beep_dur_var.get())
+        except (tk.TclError, ValueError):
+            duration_ms = None
+        if duration_ms is None or not BEEP_MIN_MS <= duration_ms <= BEEP_MAX_MS:
+            self._log(f"[WARN] Beep duration must be {BEEP_MIN_MS}-{BEEP_MAX_MS} ms")
+            return
+        conn = self.conn
+        freq = self.buzzer_freq_var.get()
+        self._buzzer_used = True
+        with self._beep_lock:
+            self._beep_id += 1
+            beep_id = self._beep_id
+
+        def run():
+            try:
+                conn.write_register(REG_BZR_FREQ, freq)
+                conn.write_register(REG_BZR_EN, 1)
+                self._log(f"[TX] Buzzer = On @ {format_value(REG_BZR_FREQ, freq)} "
+                          f"for {duration_ms} ms")
+                time.sleep(duration_ms / 1000)
+                with self._beep_lock:
+                    if beep_id != self._beep_id:
+                        return   # superseded by a newer Beep, or stopped
+                conn.write_register(REG_BZR_EN, 0)
+                self._log("[TX] Buzzer = Off")
+            except Exception as e:
+                self._log(f"[ERROR] {e}")
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _buzzer_stop(self) -> None:
+        """Cut a beep short."""
+        with self._beep_lock:
+            self._beep_id += 1
+        self._write(REG_BZR_EN, 0)
+
+    def _silence_buzzer(self) -> None:
+        """Before disconnecting: make sure a beep in progress doesn't keep
+        sounding. Skipped if no beep was ever sent (e.g. old firmware)."""
+        with self._beep_lock:
+            self._beep_id += 1
+        if self._buzzer_used and self.conn and self.conn.is_connected:
+            try:
+                self.conn.write_register(REG_BZR_EN, 0)
+            except Exception as e:
+                print(f"[WARN] Could not switch buzzer off: {e}")
+            self._buzzer_used = False
+
     # ----------------------------------------------------------- callbacks --
 
     def _on_event(self, register: int, value: int) -> None:
@@ -266,6 +378,7 @@ class App(tk.Tk):
         self.after(0, _update)
 
     def _on_close(self):
+        self._silence_buzzer()
         if self.conn:
             self.conn.disconnect()
         self.destroy()
