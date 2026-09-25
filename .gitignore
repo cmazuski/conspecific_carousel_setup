@@ -24,4 +24,5 @@ recording/
 # OS
 .DS_Store
 Thumbs.db
-SocialMemory/last_settings.json
+# Setup dialogs' remembered values — per-PC operator state
+*/last_settings.json

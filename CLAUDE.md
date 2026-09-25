@@ -158,8 +158,9 @@ adding a column to a results DataFrame does not break replay of old sessions.
   bypass its cleanup.
 - Cameras are identified by **serial number**, not index — pylon's enumeration order is not stable.
   Each camera keeps its own sensor crop in `camera_crop_config_<serial>.json` at the repo root, so
-  two rigs can record simultaneously from two terminals. The old shared `camera_crop_config.json`
-  is only used to seed a camera's first per-serial file.
+  two rigs can record simultaneously from two terminals. A camera with no file yet records full
+  frame until a crop is picked (run `cameracontrol.py --camera <serial>` standalone to choose one).
+  These files are tracked in git, one per camera.
 - `camera_select.py` builds the setup dialogs' camera dropdown by shelling out to
   `cameracontrol.py --list-cameras`, keeping `pypylon` out of the Tk process.
 - Cropping sets the camera's sensor ROI (`Width/Height/OffsetX/OffsetY`), not a software crop.
@@ -203,7 +204,7 @@ These encode failures already debugged on the rig — preserve them.
 - **Setup dialogs persist their last values** to `<Family>/last_settings.json`, next to the
   dialog module. (The dialogs' default `save_root` is still the repo root, not the family folder.)
   Adding a field means adding it to both the save and the restore path; these files are
-  local operator state, not configuration to depend on.
+  per-PC operator state (gitignored), not configuration to depend on.
 - **Species changes behavior.** `rat` gets `incremental_reward` (valve time grows with reward
   count, capped); `mouse` gets a fixed `deliver_reward`. Setup dialogs carry separate
   `SPECIES_DEFAULTS`.

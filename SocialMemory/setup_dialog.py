@@ -1,7 +1,8 @@
 # SocialMemory/setup_dialog.py — Pre-session configuration dialog for Social Memory tasks
 #
-# Mode: training  → ClassicalConditioningSession
-#       task      → SocialMemoryTaskSession
+# Mode: training    → ClassicalConditioningSession (AutoRewardSession if auto_reward)
+#       task        → SocialMemoryTaskSession
+#       passivetest → PassiveTestSession
 #
 # Returns a dict of validated parameters on Start, or None on Cancel.
 

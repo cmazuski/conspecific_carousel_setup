@@ -136,7 +136,7 @@ def _start_camera_recording(session_start: float, save_dir: str,
                   f"Continuing session without video.")
             return None
         print(f"[INFO] Camera recording started (PID {proc.pid}, "
-              f"camera {camera or 'first found'}) → {save_dir}")
+              f"camera {camera or 'first found'}) -> {save_dir}")
         return proc
     except Exception as e:
         print(f"[WARN] Could not start camera recording: {e}")

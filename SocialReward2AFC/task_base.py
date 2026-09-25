@@ -115,7 +115,7 @@ class TaskBase2AFC(Base2AFCSession):
         # 1. Turntable to presentation angle
         start_angle    = self._current_angle
         turn_direction = self._turn_to(presentation_angle)
-        print(f"Table: {turn_direction} → {presentation_angle}° "
+        print(f"Table: {turn_direction} -> {presentation_angle}° "
               f"(correct port: {correct_port})")
         wait_for_table_stopped(self.shared, device=self.ser)
 

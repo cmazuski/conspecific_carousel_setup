@@ -1,4 +1,12 @@
+# Rig control + GUIs
 pyserial
 numpy
 pandas
 matplotlib
+
+# Camera (cameracontrol.py)
+pypylon
+opencv-python
+
+# Also required, not pip-installable: ffmpeg.exe on PATH — cameracontrol.py
+# pipes frames into it for H.264 encoding and refuses to start without it.

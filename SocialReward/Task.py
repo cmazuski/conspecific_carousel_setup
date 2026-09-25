@@ -148,7 +148,7 @@ class SocialTaskSession(BaseSocialSession):
         # ── 2. Move turntable to presentation position ────────────────────────
         start_angle    = self._current_angle
         turn_direction = self._turn_to(presentation_angle)
-        print(f"Table: {turn_direction} from {start_angle}° → {presentation_angle}°")
+        print(f"Table: {turn_direction} from {start_angle}° -> {presentation_angle}°")
         wait_for_table_stopped(self.shared, device=self.ser)
 
         # ── 3. LED A on → wait for port A poke (no deadline) ─────────────────

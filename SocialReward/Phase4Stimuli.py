@@ -143,7 +143,7 @@ class Phase4StimuliSession(BaseSocialSession):
         # ── 2. Move turntable to presentation position ────────────────────────
         start_angle    = self._current_angle
         turn_direction = self._turn_to(presentation_angle)
-        print(f"Table: {turn_direction} from {start_angle}° → {presentation_angle}°")
+        print(f"Table: {turn_direction} from {start_angle}° -> {presentation_angle}°")
         wait_for_table_stopped(self.shared, device=self.ser)
 
         # ── 3. LED A on → wait for port A poke (no deadline) ─────────────────
@@ -260,7 +260,7 @@ class Phase4StimuliSession(BaseSocialSession):
         direction    = random.choice([1, -1])
         return_angle = (self._current_angle + direction * magnitude) % 360
         self._turn_to(return_angle)
-        print(f"Table → {return_angle}° "
+        print(f"Table -> {return_angle}° "
               f"(random {magnitude}° {'CW' if direction > 0 else 'CCW'})")
         wait_for_table_stopped(self.shared, device=self.ser)
 

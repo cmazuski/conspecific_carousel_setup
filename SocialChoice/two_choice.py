@@ -96,7 +96,7 @@ class TwoChoiceSession(BaseSCSession):
             self._streak_count = 0
             self._streak_port  = None
             print(f"[Anti-bias] {BIAS_THRESHOLD} consecutive {poked_port} choices "
-                  f"→ forcing {other}")
+                  f"-> forcing {other}")
 
     # ── Trial ─────────────────────────────────────────────────────────────────
 

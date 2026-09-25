@@ -141,7 +141,7 @@ class Phase3Session(BaseSocialSession):
         deadline = door_open_time + TABLE_SENSOR_TIMEOUT
         while door_opened and self.running and not STOP_EVENT.is_set():
             if time.time() >= deadline:
-                print(f"Sensory minimum not met within {TABLE_SENSOR_TIMEOUT} s → missed trial")
+                print(f"Sensory minimum not met within {TABLE_SENSOR_TIMEOUT} s -> missed trial")
                 break
 
             s_time, contact_start = self._wait_for_table_contact(deadline=deadline)

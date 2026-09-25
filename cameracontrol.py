@@ -62,12 +62,9 @@ PREVIEW_EVERY_N_FRAMES = 3           # Update the preview only every N frames �
                                      # so it doesn't add latency to the recording/pulse loop
 PREVIEW_MAX_WIDTH    = 960           # Downscale the preview/crop-selector window to at
                                      # most this width
-CROP_CONFIG_DIR      = os.path.dirname(os.path.abspath(__file__))
 # Crops are saved per camera (camera_crop_config_<serial>.json) — two cameras
-# looking at two different rigs need two different ROIs. This is the single
-# shared file the old one-camera setup wrote; it's used to seed a camera's own
-# file the first time that camera runs, and never written to again.
-LEGACY_CROP_CONFIG   = os.path.join(CROP_CONFIG_DIR, "camera_crop_config.json")
+# looking at two different rigs need two different ROIs.
+CROP_CONFIG_DIR      = os.path.dirname(os.path.abspath(__file__))
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── Camera selection ─────────────────────────────────────────────────────────
@@ -304,17 +301,11 @@ def save_crop_config(path, cfg):
 
 def resolve_crop_config(args, serial):
     """Where this camera's crop lives. Each camera gets its own file so a second
-    camera's ROI doesn't overwrite the first's; the first time a camera runs,
-    the old shared file (single-camera setups) seeds it."""
+    camera's ROI doesn't overwrite the first's; a camera with no file yet
+    records full frame until a crop is chosen."""
     if args.crop_config:
         return args.crop_config
-    path = os.path.join(CROP_CONFIG_DIR, f"camera_crop_config_{serial}.json")
-    if not os.path.exists(path) and os.path.exists(LEGACY_CROP_CONFIG):
-        try:
-            shutil.copyfile(LEGACY_CROP_CONFIG, path)
-        except OSError:
-            pass  # non-fatal: falls through to "no saved crop" / full frame
-    return path
+    return os.path.join(CROP_CONFIG_DIR, f"camera_crop_config_{serial}.json")
 
 def decide_crop(camera, converter, args, crop_config):
     """Apply --crop policy, loading/saving this camera's crop from `crop_config`.
@@ -507,7 +498,7 @@ def main():
         input("Recording... Press ENTER to stop.\n")
         stop_flag.set()
 
-    print(f"Recording started → {video_path}")
+    print(f"Recording started -> {video_path}")
     print(f"Resolution: {width}x{height} @ {FRAME_RATE} fps ({'mono' if is_mono else 'color'})")
     print(f"H264 CRF {H264_CRF}, preset {FFMPEG_PRESET}")
     print(f"TTL pulse every {PULSE_EVERY_N_FRAMES} frames."
