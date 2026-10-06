@@ -41,6 +41,14 @@ BUZZER_HZ_PER_UNIT = 20
 BUZZER_FREQ_MIN = 1
 BUZZER_FREQ_MAX = 255
 
+
+def buzzer_freq_value(freq_hz):
+    """Frequency register value for freq_hz, rounded to the nearest step the
+    firmware can produce (BUZZER_HZ_PER_UNIT) and clamped to the valid range.
+    The actual frequency is the returned value x BUZZER_HZ_PER_UNIT."""
+    value = round(float(freq_hz) / BUZZER_HZ_PER_UNIT)
+    return max(BUZZER_FREQ_MIN, min(BUZZER_FREQ_MAX, value))
+
 REGISTER_NAMES = {
     REG_LED_SYNC: "LED/Sync",
     REG_DOOR_SENSOR: "Door Sensor",

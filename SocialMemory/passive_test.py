@@ -19,9 +19,19 @@
 # Between presentations (CC ITI):
 #   Classical conditioning runs for a duration drawn from [iti_min, iti_max].
 #
-# Two DataFrames are recorded:
+# Buzzer (optional, needs firmware with buzzer support). The setup dialog
+# offers one mode or the other (buzzer_mode "iti" or "contact"), never both:
+#   ITI buzzes    — buzzer_iti_total buzzes spread over the ITIs (there is one
+#                   ITI before every presentation except the first): as evenly
+#                   as possible, the ITIs getting an extra one picked at random,
+#                   each buzz at a random time within its ITI.
+#   Contact buzz  — for each box ticked in buzzer_boxes, a buzz at the first
+#                   table beam break of every presentation of that box.
+#
+# DataFrames recorded:
 #   presentations_df — one row per stimulus presentation (includes box + label)
 #   conditioning_df  — one row per CC trial across all ITIs
+#   buzzer_df        — one row per buzz (only written to disk if the buzzer is on)
 
 import heapq
 import random
@@ -29,7 +39,7 @@ import random
 import pandas as pd
 
 from hardware import SharedSensorState, STOP_EVENT
-from .base_session import BaseSMSession
+from .base_session import BaseSMSession, distribute_buzzes
 
 N_BOXES = 4
 
@@ -117,6 +127,16 @@ class PassiveTestSession(BaseSMSession):
         cc_delay: float = 0.0,
         sequence: list = None,
         session_start: float = None,
+        # Buzzer (None = off)
+        buzzer_freq_hz: float = None,
+        buzzer_duration: float = 0.5,
+        buzzer_iti_total: int = 0,
+        buzzer_boxes=None,    # 4 bools: buzz at first beam break for that box
+        # Continuation of a stopped session (see resume.py): the remaining
+        # presentations' original labels and the first one's number, so the
+        # two sessions' rows merge into one planned sequence.
+        period_labels: list = None,
+        first_presentation_num: int = 1,
     ):
         super().__init__(ser, shared, species, valve_times, session_start=session_start)
         if len(box_ids) != N_BOXES or len(box_n) != N_BOXES:
@@ -142,6 +162,18 @@ class PassiveTestSession(BaseSMSession):
         self.cc_reward_prob = cc_reward_prob
         self.cc_delay = cc_delay
 
+        self.buzzer_freq_hz = buzzer_freq_hz
+        self.buzzer_duration = buzzer_duration
+        self.buzzer_boxes = ([bool(b) for b in buzzer_boxes] if buzzer_boxes
+                             else [False] * N_BOXES)
+        self.period_labels = list(period_labels) if period_labels else None
+        self._presentation_counter = first_presentation_num - 1
+
+        # Buzzes per ITI; entry i is the ITI before presentation i + 2.
+        n_itis = max(0, len(self.sequence) - 1)
+        self.iti_buzz_counts = (distribute_buzzes(buzzer_iti_total, n_itis)
+                                if buzzer_freq_hz is not None else [0] * n_itis)
+
         self.presentations_df = pd.DataFrame(columns=[
             "presentation_num",
             "period",            # Box0_1, Box2_1, Box0_2, ...
@@ -155,6 +187,7 @@ class PassiveTestSession(BaseSMSession):
             "bout_count",              # number of non-triggered → triggered transitions
             "presentation_start",      # time.time() when timer started (beam first broken)
             "presentation_end",        # time.time() when presentation duration elapsed
+            "buzz_on_contact",         # buzzer set to sound at first beam break
         ])
 
         self.conditioning_df = pd.DataFrame(columns=[
@@ -174,7 +207,7 @@ class PassiveTestSession(BaseSMSession):
     # ── Session loop (override — fixed pseudorandom sequence) ─────────────────
 
     def _run_session(self):
-        periods = label_sequence(self.sequence)
+        periods = self.period_labels or label_sequence(self.sequence)
 
         print(f"[INFO] {self._session_name} started")
         print("[INFO] Boxes: " + ", ".join(
@@ -184,22 +217,38 @@ class PassiveTestSession(BaseSMSession):
         print(f"[INFO] Sequence: {periods}")
         print(f"[INFO] Duration {self.presentation_duration} s, "
               f"ITI {self.iti_min}–{self.iti_max} s")
+        if self.buzzer_freq_hz is not None:
+            print(f"[INFO] Buzzer: {self.buzzer_freq_hz:.0f} Hz for "
+                  f"{self.buzzer_duration} s; ITI buzzes per ITI "
+                  f"{self.iti_buzz_counts}; contact buzz on boxes "
+                  f"{[i for i in range(N_BOXES) if self.buzzer_boxes[i]]}")
 
         try:
             for i, (box, period) in enumerate(zip(self.sequence, periods)):
                 if not self.running or STOP_EVENT.is_set():
                     break
                 if i > 0:
-                    self._run_cc_iti(self.iti_min, self.iti_max, f"CC_pre{i + 1}")
+                    self._run_cc_iti(self.iti_min, self.iti_max, f"CC_pre{i + 1}",
+                                     n_buzzes=self.iti_buzz_counts[i - 1])
                 if not self.running or STOP_EVENT.is_set():
                     break
                 self._run_presentation(
                     box * 90, self.presentation_duration, period,
-                    extra_fields={"box": box, "label": self.box_ids[box]},
+                    extra_fields={"box": box, "label": self.box_ids[box],
+                                  "buzz_on_contact": self._contact_buzz(box)},
+                    buzz_on_contact=self._contact_buzz(box),
                 )
+        except TimeoutError as e:
+            # The board stopped answering commands. One clear line instead of a
+            # traceback; main's shutdown checks the board and saves everything.
+            print(f"[ERROR] {self._session_name}: the board did not answer a "
+                  f"command ({e}) - ending the session")
         finally:
             self.running = False
             print(f"[INFO] {self._session_name} ended")
+
+    def _contact_buzz(self, box: int) -> bool:
+        return self.buzzer_freq_hz is not None and self.buzzer_boxes[box]
 
     # Required by base but not used (sequence is managed above)
     def _run_trial(self):

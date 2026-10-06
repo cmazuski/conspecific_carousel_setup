@@ -18,9 +18,11 @@ import traceback
 
 import pandas as pd
 
+from protocol import BUZZER_HZ_PER_UNIT, buzzer_freq_value
 from hardware import (
     deliver_reward,
     incremental_reward,
+    sound_buzzer,
     sensor_held,
     shutdown_outputs,
     open_door,
@@ -38,6 +40,37 @@ from hardware import (
 # applies to the base valve time itself.
 REWARD_INCREMENT_S = 0.015
 REWARD_MAX_VALVE_S = 1.0
+
+# Minimum silence between two buzzes in the same ITI, so they stay distinct.
+BUZZ_MIN_GAP_S = 0.5
+
+
+def distribute_buzzes(total: int, n_itis: int) -> list:
+    """Spread `total` buzzes over `n_itis` ITIs as evenly as possible, choosing
+    at random which ITIs get the extra ones: 15 over 20 ITIs -> 15 random ITIs
+    get 1; 30 over 20 -> every ITI gets 1 and 10 random ITIs get a second."""
+    if n_itis <= 0:
+        return []
+    base, extra = divmod(int(total), n_itis)
+    counts = [base] * n_itis
+    for i in random.sample(range(n_itis), extra):
+        counts[i] += 1
+    return counts
+
+
+def random_buzz_offsets(n: int, window: float, duration: float,
+                        min_gap: float = BUZZ_MIN_GAP_S) -> list:
+    """n buzz start times (s from the start of a `window`-long ITI), uniformly
+    random but never overlapping: each buzz ends, plus min_gap, before the next
+    starts, and the last one ends within the window. If they can't all fit, the
+    slack is 0 and they run back to back from the start (the setup dialog
+    rejects settings where that could happen)."""
+    if n <= 0:
+        return []
+    spacing = duration + min_gap
+    slack = max(0.0, window - (n * spacing - min_gap))
+    points = sorted(random.uniform(0, slack) for _ in range(n))
+    return [p + i * spacing for i, p in enumerate(points)]
 
 
 class BaseSMSession:
@@ -106,6 +139,21 @@ class BaseSMSession:
         # Guards reads/writes of results dataframes shared between the
         # session thread (appends rows) and the main thread (polls for the GUI).
         self._df_lock = threading.Lock()
+
+        # Buzzer — off unless a subclass sets buzzer_freq_hz (currently only
+        # PassiveTestSession). Every buzz is logged to buzzer_df, which main
+        # writes as buzzer_events.csv.
+        self.buzzer_freq_hz = None
+        self.buzzer_duration = 0.0
+        self.buzzer_df = pd.DataFrame(columns=[
+            "buzz_num",
+            "trigger",     # "iti" (scheduled in the ITI) or "contact" (first beam break)
+            "period",      # ITI label (CC_pre3) or presentation label (Box1_2)
+            "t_on",        # relative to session_start (s)
+            "t_off",
+            "freq_hz",     # actual frequency (rounded to the firmware's 20 Hz steps)
+            "duration",    # requested duration (s)
+        ])
 
     # ── Session control ───────────────────────────────────────────────────────
 
@@ -185,6 +233,72 @@ class BaseSMSession:
                                       max_valve_time=REWARD_MAX_VALVE_S)
         deliver_reward(self.ser, port, vt)
         return vt
+
+    @staticmethod
+    def _background(fn, *args, **kwargs) -> threading.Thread:
+        """Run a door/table helper in a daemon thread. If it fails (e.g. the
+        board stopped answering), print one line instead of a traceback — the
+        session's own wait on door/table state times out and reports it."""
+        def run():
+            try:
+                fn(*args, **kwargs)
+            except Exception as e:
+                print(f"[ERROR] {getattr(fn, '__name__', 'helper')} failed: {e}")
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        return t
+
+    # ── Buzzer ────────────────────────────────────────────────────────────────
+
+    def _buzz(self, trigger: str, period: str) -> None:
+        """Sound one buzz (blocking) and log it to buzzer_df. A failed buzz is
+        printed and skipped — it must never end the session."""
+        try:
+            t_on, t_off = sound_buzzer(self.ser, self.buzzer_freq_hz,
+                                       self.buzzer_duration)
+        except Exception as e:
+            print(f"[ERROR] Buzzer ({trigger}, {period}) failed: {e}")
+            return
+        with self._df_lock:
+            self.buzzer_df.loc[len(self.buzzer_df)] = {
+                "buzz_num": len(self.buzzer_df) + 1,
+                "trigger":  trigger,
+                "period":   period,
+                "t_on":     t_on - self.session_start,
+                "t_off":    t_off - self.session_start,
+                "freq_hz":  buzzer_freq_value(self.buzzer_freq_hz) * BUZZER_HZ_PER_UNIT,
+                "duration": self.buzzer_duration,
+            }
+        print(f"[INFO] Buzz ({trigger}) in {period}")
+
+    def _buzz_async(self, trigger: str, period: str) -> threading.Thread:
+        """_buzz in a daemon thread, so the caller's timing loop keeps running."""
+        t = threading.Thread(target=self._buzz, args=(trigger, period), daemon=True)
+        t.start()
+        return t
+
+    def _start_iti_buzzes(self, n: int, iti: float, period: str):
+        """Schedule n buzzes at random, non-overlapping times within an ITI of
+        `iti` s starting now. Returns the scheduler thread (None if n == 0)."""
+        if n <= 0 or self.buzzer_freq_hz is None:
+            return None
+        iti_start = time.time()
+        offsets = random_buzz_offsets(n, iti, self.buzzer_duration)
+        print(f"[INFO] {period}: {n} buzz(es) at "
+              + ", ".join(f"{o:.1f}" for o in offsets) + " s into the ITI")
+
+        def run():
+            for offset in offsets:
+                while (self.running and not STOP_EVENT.is_set()
+                       and time.time() < iti_start + offset):
+                    time.sleep(0.01)
+                if not self.running or STOP_EVENT.is_set():
+                    return
+                self._buzz("iti", period)
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        return t
 
     def _wait_for_table_contact(self):
         """Wait for table sensor to trigger; measure hold duration.
@@ -276,12 +390,16 @@ class BaseSMSession:
         self._current_angle = 0
 
     def _run_presentation(self, angle: int, duration: float, period: str,
-                           extra_fields: dict = None) -> None:
+                           extra_fields: dict = None,
+                           buzz_on_contact: bool = False) -> None:
         """Present a stimulus at `angle` for `duration` seconds, logging a row to
         self.presentations_df. Ends by turning the stimulus away (45° CCW), closing
         the door safely, then returning the table to home (0°) for the ITI — turning
         the opposite direction from the outbound trip — before the next presentation
-        turns from home into position before its door opens."""
+        turns from home into position before its door opens.
+
+        buzz_on_contact: sound the buzzer (in the background) at the first table
+        beam break, i.e. when the presentation timer starts."""
         self._presentation_counter += 1
         print(f"\n--- {period} (#{self._presentation_counter}): "
               f"{angle}° for {duration} s ---")
@@ -291,7 +409,7 @@ class BaseSMSession:
         wait_for_table_stopped(self.shared, timeout=15.0, device=self.ser)
 
         # 2. Open door (async); wait for fully open
-        threading.Thread(target=open_door, args=(self.ser,), daemon=True).start()
+        self._background(open_door, self.ser)
         door_opened = wait_for_door_state(self.shared, "door opened",
                                           timeout=self.DOOR_WAIT_TIMEOUT,
                                           device=self.ser)
@@ -313,15 +431,15 @@ class BaseSMSession:
             if state == "triggered":
                 pres_start = time.time()
                 print(f"[INFO] {period}: beam triggered, presentation timer started")
+                if buzz_on_contact and self.buzzer_freq_hz is not None:
+                    self._buzz_async("contact", period)
                 break
             time.sleep(0.01)
 
         if pres_start is None:
             # Stopped before any beam contact — close door and return
-            threading.Thread(
-                target=close_door_safe, args=(self.ser, self.shared),
-                kwargs={"timeout": self.DOOR_WAIT_TIMEOUT}, daemon=True,
-            ).start()
+            self._background(close_door_safe, self.ser, self.shared,
+                             timeout=self.DOOR_WAIT_TIMEOUT)
             wait_for_door_state(self.shared, "door closed",
                                 timeout=self.DOOR_WAIT_TIMEOUT, device=self.ser)
             wait_for_table_stopped(self.shared, timeout=15.0, device=self.ser)
@@ -350,21 +468,17 @@ class BaseSMSession:
         print(f"[INFO] {period}: complete — sampling_time={contact_time:.3f} s")
 
         # 5. Remove stimulus: 45° CCW (async)
-        threading.Thread(
-            target=self._turn_ccw_partial, args=(45,), daemon=True
-        ).start()
+        self._background(self._turn_ccw_partial, 45)
 
         # 6. Close door safely (pauses if sensors active). The operator can
         # toggle self.door_override here to force the door open on a mechanical
         # failure/obstruction and then close it again; the wait below pauses its
         # timeout for as long as the door is held open, so the session resumes
         # gracefully however long the repair takes.
-        threading.Thread(
-            target=close_door_safe, args=(self.ser, self.shared),
-            kwargs={"override": self.door_override,
-                    "held_open": self._door_held_open,
-                    "timeout": self.DOOR_WAIT_TIMEOUT}, daemon=True,
-        ).start()
+        self._background(close_door_safe, self.ser, self.shared,
+                         override=self.door_override,
+                         held_open=self._door_held_open,
+                         timeout=self.DOOR_WAIT_TIMEOUT)
         door_closed = wait_for_door_state(
             self.shared, "door closed", timeout=self.DOOR_WAIT_TIMEOUT,
             device=self.ser, pause_event=self._door_held_open)
@@ -411,16 +525,29 @@ class BaseSMSession:
               f"{'door closed' if door_closed else 'door NOT confirmed closed'}"
               f", table at home")
 
-    def _run_cc_iti(self, iti_min: float, iti_max: float, period_label: str) -> None:
+    def _run_cc_iti(self, iti_min: float, iti_max: float, period_label: str,
+                    n_buzzes: int = 0) -> None:
         """Run classical conditioning for a random duration in [iti_min, iti_max],
         appending trials to self.conditioning_df. Requires self.cc_ports,
         cc_led_on_time, cc_iti_min, cc_iti_max, cc_reward_prob, cc_delay.
 
         If self.cc_ports is empty (all of portA/B/C unchecked in the GUI), no
         conditioning trials are run — this just waits out the same ITI
-        duration as a plain, unfilled ITI."""
-        iti = random.uniform(iti_min, iti_max)
+        duration as a plain, unfilled ITI.
 
+        n_buzzes buzzes (if the buzzer is on) sound at random times across the
+        whole ITI, including any cc_delay, alongside the conditioning."""
+        iti = random.uniform(iti_min, iti_max)
+        buzz_thread = self._start_iti_buzzes(n_buzzes, iti, period_label)
+        try:
+            self._run_cc_iti_body(iti, period_label)
+        finally:
+            if buzz_thread is not None:
+                # All buzzes are scheduled to end within the ITI; bounded join
+                # so a late one can't overlap the next presentation.
+                buzz_thread.join(timeout=self.buzzer_duration + 2.0)
+
+    def _run_cc_iti_body(self, iti: float, period_label: str) -> None:
         if not self.cc_ports:
             print(f"\n[INFO] {period_label}: ITI = {iti:.1f} s (no CC ports selected)")
             self._wait(iti)

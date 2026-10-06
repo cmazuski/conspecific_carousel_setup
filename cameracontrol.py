@@ -8,10 +8,14 @@ Basler camera recording script
   its own saved crop
 - Optionally crops the sensor ROI before recording (less data in at the source,
   not just a smaller output) via an interactive selector, with the chosen crop
-  saved to disk and reused on future runs — see --crop
+  saved to disk and reupython sed on future runs — see --crop
 - Auto-detects mono vs color cameras and encodes accordingly (no wasted chroma
   data on mono sensors)
-- Sends a brief TTL pulse every 30 frames (~1 per second at 30 fps)
+- Sets the camera's frame rate (--fps, default 30) and optionally its exposure
+  (--exposure-ms), after cropping - the crop height and the exposure both cap
+  how fast the camera can go, so the rate actually achieved is read back and
+  used for the video
+- Sends a brief TTL pulse about once per second (every round(fps) frames)
 - Logs a per-frame timestamp (frame_timestamps.csv), relative to --session-start
   if given, so the video can be aligned with other timestamp files from the
   same session
@@ -36,7 +40,7 @@ import csv
 import shutil
 import subprocess
 import sys
-from pypylon import pylon
+from pypylon import pylon, genicam
 import cv2
 import os
 import time
@@ -48,13 +52,16 @@ from datetime import datetime
 OUTPUT_LINE         = "Line4"        # Change to your output line
 OUTPUT_USER         = "UserOutput3"  # Change if your camera uses "UserOutput" instead
 SAVE_DIR            = "recording"    # Folder to save video into
-FRAME_RATE          = 30.0           # Must match your camera's actual frame rate
-PULSE_EVERY_N_FRAMES = 30            # Send a TTL pulse every N frames
+DEFAULT_FRAME_RATE  = 30.0           # Used when --fps isn't given. Always written to
+                                     # the camera, so a rate left behind by an earlier
+                                     # run can't silently change this one.
+SYNC_PULSE_HZ       = 1.0            # TTL pulse about this often: every
+                                     # round(fps / SYNC_PULSE_HZ) frames
 PULSE_WIDTH_S       = 0.01          # Pulse width in seconds (1 ms)
 H264_CRF            = 23             # H264 quality: lower = better quality, larger file
                                      # 18 = near-lossless, 23 = default, 28 = smaller file
 FFMPEG_PRESET        = "veryfast"    # Encoder speed/efficiency tradeoff. Must comfortably
-                                     # keep up with FRAME_RATE or frames will back up —
+                                     # keep up with the frame rate or frames will back up —
                                      # only slow this down (e.g. "fast", "medium") if the
                                      # recording machine has CPU headroom to spare.
 SHOW_PREVIEW         = True          # Live preview window while recording
@@ -154,6 +161,10 @@ def setup_user_output(camera) -> bool:
         if camera.LineMode.Value != "Output":
             camera.LineMode.Value = "Output"
         camera.LineSource.Value = OUTPUT_USER
+        # LineInverter is stored per camera too; left on, the line idles high
+        # and pulses low, and CameraTriggerLogger (value == 1 only) sees nothing.
+        if camera.LineInverter.Value:
+            camera.LineInverter.Value = False
         camera.UserOutputSelector.Value = OUTPUT_USER
         return True
     except Exception as e:
@@ -163,6 +174,54 @@ def setup_user_output(camera) -> bool:
 
 def set_output(camera, state: bool):
     camera.UserOutputValue.Value = state
+
+def _feature(camera, *names):
+    """First of `names` this camera has (USB3 and older GigE Basler models
+    name some features differently), or None."""
+    for name in names:
+        try:
+            node = getattr(camera, name)
+        except Exception:
+            continue
+        if genicam.IsAvailable(node):
+            return node
+    return None
+
+def configure_frame_rate(camera, fps: float, exposure_ms: float = None) -> float:
+    """Set the exposure (if given) and frame rate, and return the rate the camera
+    will actually run at. Call after cropping: a tall ROI or a long exposure
+    caps the rate (e.g. 30 ms exposure -> 33 fps at most), so the camera may
+    deliver less than asked - then this warns and returns the real rate."""
+    exposure = _feature(camera, "ExposureTime", "ExposureTimeAbs")
+    if exposure_ms is not None:
+        auto = _feature(camera, "ExposureAuto")
+        if auto is not None and genicam.IsWritable(auto):
+            auto.Value = "Off"
+        if exposure is None:
+            print("[WARN] Camera has no exposure setting - --exposure-ms ignored.")
+        else:
+            exposure.Value = exposure_ms * 1000.0
+
+    enable = _feature(camera, "AcquisitionFrameRateEnable")
+    rate = _feature(camera, "AcquisitionFrameRate", "AcquisitionFrameRateAbs")
+    resulting = _feature(camera, "ResultingFrameRate", "ResultingFrameRateAbs")
+    if rate is None or resulting is None:
+        print(f"[WARN] Camera has no frame-rate setting - assuming {fps:g} fps. "
+              f"If that's wrong the video will play at the wrong speed "
+              f"(frame_timestamps.csv stays correct).")
+        return fps
+    if enable is not None:
+        enable.Value = True
+    rate.Value = min(max(fps, rate.Min), rate.Max)
+    achieved = float(resulting.Value)
+    if achieved < fps - 0.5:
+        exp_ms = exposure.Value / 1000.0 if exposure is not None else float("nan")
+        print(f"[WARN] Asked for {fps:g} fps but the camera can only do {achieved:.1f} fps "
+              f"with its current settings (exposure {exp_ms:.1f} ms, ROI "
+              f"{camera.Width.Value}x{camera.Height.Value}). Recording at {achieved:.1f} fps. "
+              f"Exposure must be under {1000.0 / fps:.1f} ms for {fps:g} fps; a shorter crop "
+              f"(fewer rows) also raises the maximum.")
+    return achieved
 
 def show_preview(frame, width, height, window="Camera Preview") -> bool:
     """Display frame (downscaled to PREVIEW_MAX_WIDTH). Returns True if 'q' was pressed.
@@ -362,13 +421,13 @@ def find_ffmpeg():
         )
     return path
 
-def start_ffmpeg_writer(ffmpeg_path, video_path, width, height, is_mono):
+def start_ffmpeg_writer(ffmpeg_path, video_path, width, height, is_mono, fps):
     pix_fmt_in = "gray" if is_mono else "bgr24"
     log_path = video_path + ".ffmpeg.log"
     cmd = [
         ffmpeg_path, "-y",
         "-f", "rawvideo", "-pix_fmt", pix_fmt_in,
-        "-s", f"{width}x{height}", "-r", str(FRAME_RATE),
+        "-s", f"{width}x{height}", "-r", f"{fps:.3f}",
         "-i", "-",
         "-an",
         "-c:v", "libx264", "-crf", str(H264_CRF), "-preset", FFMPEG_PRESET,
@@ -427,6 +486,17 @@ def parse_args():
              "two instances in two terminals each get their own.",
     )
     parser.add_argument(
+        "--fps", type=float, default=DEFAULT_FRAME_RATE,
+        help=f"Frame rate to record at (default {DEFAULT_FRAME_RATE:g}). If the "
+             "camera can't reach it with the current exposure and crop, it records "
+             "at the fastest rate it can and says so.",
+    )
+    parser.add_argument(
+        "--exposure-ms", type=float, default=None,
+        help="Exposure time in ms (turns auto-exposure off). Default: leave the "
+             "camera's current exposure. Must be under 1000/fps ms to reach fps.",
+    )
+    parser.add_argument(
         "--list-cameras", action="store_true",
         help="Print the attached Basler cameras as JSON and exit (opens nothing, "
              "so it's safe to run while a recording is in progress).",
@@ -475,6 +545,10 @@ def main():
     decide_crop(camera, converter, args,
                 resolve_crop_config(args, cam_info["serial"]))
 
+    # After cropping: the ROI height limits the achievable rate.
+    fps = configure_frame_rate(camera, args.fps, args.exposure_ms)
+    pulse_every_n_frames = max(1, round(fps / SYNC_PULSE_HZ))
+
     # Grab one frame first to get resolution (post-crop) for the video writer
     first_frame = grab_single_frame(camera, converter)
     height, width = first_frame.shape[:2]
@@ -483,7 +557,7 @@ def main():
         show_preview(first_frame, width, height, preview_window)
 
     ffmpeg_proc, ffmpeg_log, ffmpeg_log_path = start_ffmpeg_writer(
-        ffmpeg_path, video_path, width, height, is_mono)
+        ffmpeg_path, video_path, width, height, is_mono, fps)
     assert ffmpeg_proc.stdin is not None  # guaranteed by stdin=subprocess.PIPE above
 
     # Write the first frame we already grabbed
@@ -499,15 +573,38 @@ def main():
         stop_flag.set()
 
     print(f"Recording started -> {video_path}")
-    print(f"Resolution: {width}x{height} @ {FRAME_RATE} fps ({'mono' if is_mono else 'color'})")
+    print(f"Resolution: {width}x{height} @ {fps:.2f} fps ({'mono' if is_mono else 'color'})")
     print(f"H264 CRF {H264_CRF}, preset {FFMPEG_PRESET}")
-    print(f"TTL pulse every {PULSE_EVERY_N_FRAMES} frames."
+    print(f"TTL pulse every {pulse_every_n_frames} frames."
           if output_available else "TTL pulse disabled (no digital output line on this camera).")
     if SHOW_PREVIEW:
         print("Live preview window open — press 'q' there (or ENTER here) to stop.")
 
     key_thread = threading.Thread(target=wait_for_enter, daemon=True)
     key_thread.start()
+
+    # The TTL pulse runs on its own thread: done inline, its PULSE_WIDTH_S
+    # sleep plus two register writes stalled the grab loop long enough to drop
+    # a frame at ~1 pulse in 3 at 60 fps (never at 30). The grab loop now just
+    # signals it; the pulse starts within a few ms of frame N being retrieved.
+    pulse_request = threading.Event()
+
+    def pulse_worker():
+        while not stop_flag.is_set():
+            if not pulse_request.wait(timeout=0.2):
+                continue
+            pulse_request.clear()
+            try:
+                set_output(camera, True)
+                time.sleep(PULSE_WIDTH_S)
+                set_output(camera, False)
+            except Exception as e:
+                print(f"[WARN] TTL pulse failed: {e}")
+
+    pulse_thread = None
+    if output_available:
+        pulse_thread = threading.Thread(target=pulse_worker, daemon=True)
+        pulse_thread.start()
 
     camera.StartGrabbing(pylon.GrabStrategy_LatestImageOnly)
 
@@ -527,10 +624,8 @@ def main():
 
                         # TTL pulse every N frames (skipped if this camera has
                         # no usable digital output line — see output_available)
-                        if output_available and frame_count % PULSE_EVERY_N_FRAMES == 0:
-                            set_output(camera, True)
-                            time.sleep(PULSE_WIDTH_S)
-                            set_output(camera, False)
+                        if output_available and frame_count % pulse_every_n_frames == 0:
+                            pulse_request.set()
 
                         if SHOW_PREVIEW and frame_count % PREVIEW_EVERY_N_FRAMES == 0:
                             if show_preview(frame, width, height, preview_window):
@@ -542,6 +637,15 @@ def main():
     except KeyboardInterrupt:
         print("Interrupted — finalizing recording...")
     finally:
+        # Stop the pulse thread (it checks stop_flag) and leave the line low
+        # before the camera closes under it.
+        stop_flag.set()
+        if pulse_thread is not None:
+            pulse_thread.join(timeout=1.0)
+            try:
+                set_output(camera, False)
+            except Exception:
+                pass
         stop_ffmpeg_writer(ffmpeg_proc, ffmpeg_log, ffmpeg_log_path)
         camera.StopGrabbing()
         camera.Close()
@@ -554,10 +658,18 @@ def main():
             csv_writer.writerows(
                 (i, f"{t:.3f}") for i, t in enumerate(frame_timestamps, start=1))
 
-        duration_s = frame_count / FRAME_RATE
+        duration_s = frame_count / fps
         size_mb = os.path.getsize(video_path) / (1024 * 1024) if os.path.exists(video_path) else 0.0
         print(f"Recording stopped.")
         print(f"  Frames:     {frame_count} ({duration_s:.1f} s)")
+        # Delivered rate from the real per-frame timestamps - a big shortfall or
+        # many gaps means frames were dropped (the PC couldn't keep up).
+        if len(frame_timestamps) > 2:
+            span = frame_timestamps[-1] - frame_timestamps[0]
+            gaps = [b - a for a, b in zip(frame_timestamps, frame_timestamps[1:])]
+            dropped = sum(1 for g in gaps if g > 1.5 / fps)
+            print(f"  Delivered:  {(len(frame_timestamps) - 1) / span:.2f} fps "
+                  f"(set {fps:.2f}); {dropped} gap(s) longer than 1.5 frames")
         print(f"  File:       {video_path} ({size_mb:.1f} MB)")
         print(f"  Timestamps: {timestamps_path}")
 

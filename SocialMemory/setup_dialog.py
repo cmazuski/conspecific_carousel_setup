@@ -15,6 +15,9 @@ from utils import parse_motor_speed
 from tk_window_helpers import make_scrollable, fit_window_to_screen
 from camera_select import CameraChooser
 from rig_setups import SETUPS, SETUP_CAMERAS
+from protocol import (BUZZER_HZ_PER_UNIT, BUZZER_FREQ_MIN, BUZZER_FREQ_MAX,
+                      buzzer_freq_value)
+from SocialMemory.base_session import BUZZ_MIN_GAP_S
 
 _SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "last_settings.json")
@@ -107,6 +110,12 @@ class SMSetupDialog:
         self._setup_var   = tk.StringVar(value="")
         self._treatment_var = tk.BooleanVar(value=False)
         self._sensor_display_var = tk.BooleanVar(value=True)
+        # Passive test buzzer: "off", "iti" (global buzzes during the ITIs) or
+        # "contact" (at the first beam break, for the ticked boxes) — one or the other.
+        self._buzzer_mode_var = tk.StringVar(value="off")
+        self._passive_buzz_box_vars = [tk.BooleanVar(value=False) for _ in range(4)]
+        self._buzz_box_checks = []      # the per-box tick boxes (enabled in "contact")
+        self._resume_folder = None      # stopped passive test to continue (one run only)
         self._history        = {}       # history key -> recent values, newest first
         self._history_combos = {}       # history key -> (Combobox, StringVar)
 
@@ -131,6 +140,8 @@ class SMSetupDialog:
             "camera_serial": self._camera.serial,
             "setup": self._setup_var.get(),
             "show_sensor_display": self._sensor_display_var.get(),
+            "passive_buzzer_mode": self._buzzer_mode_var.get(),
+            "passive_buzz_boxes": [v.get() for v in self._passive_buzz_box_vars],
             "recent": self._history,
         }
         for k, v in self._vars.items():
@@ -180,6 +191,11 @@ class SMSetupDialog:
             self._on_setup_change()
         if "show_sensor_display" in s:
             self._sensor_display_var.set(s["show_sensor_display"])
+        if s.get("passive_buzzer_mode") in ("off", "iti", "contact"):
+            self._buzzer_mode_var.set(s["passive_buzzer_mode"])
+        for v, saved in zip(self._passive_buzz_box_vars, s.get("passive_buzz_boxes", [])):
+            v.set(bool(saved))
+        self._on_buzzer_mode_change()
         # The treatment checkbox itself is deliberately not restored — it is
         # per-session, and a stale tick would mislabel the next animal.
         recent = s.get("recent")
@@ -353,6 +369,21 @@ class SMSetupDialog:
         cam_frame.grid(row=14, column=0, columnspan=4, sticky="ew", padx=8, pady=4)
         self._camera = CameraChooser(cam_frame)
         self._camera.grid(row=0, column=0, sticky="w")
+        # Frame rate / exposure (in self._vars, so saved and restored with the
+        # other core fields).
+        ff = tk.Frame(cam_frame)
+        ff.grid(row=1, column=0, sticky="w")
+        self._vars["camera_fps"] = tk.StringVar(value="30")
+        self._vars["camera_exposure_ms"] = tk.StringVar(value="")
+        self._row(ff, "Frame rate (fps):", self._vars["camera_fps"], row=0, width=8)
+        self._row(ff, "Exposure (ms):", self._vars["camera_exposure_ms"], row=0, col=2, width=8)
+        tk.Label(cam_frame,
+                 text="(exposure blank = keep the camera's own. For 50-60 fps the exposure "
+                      "must be under 1000/fps ms (e.g. 15 ms for 60) and the crop at most "
+                      "~1000 rows for 50 fps, ~800 for 60 - otherwise it records at the "
+                      "fastest rate it can and says so in the console)",
+                 font=("Arial", 8), fg="gray", wraplength=520, justify="left").grid(
+            row=2, column=0, sticky="w", padx=6)
 
         # ── Live display ──────────────────────────────────────────────────────
         disp_frame = tk.LabelFrame(root, text="Live Display", padx=8, pady=6)
@@ -529,6 +560,7 @@ class SMSetupDialog:
         tk.Label(boxf, text="Box", anchor="w").grid(row=0, column=0, padx=6, pady=2)
         tk.Label(boxf, text="Stim label", anchor="w").grid(row=0, column=1, padx=6, pady=2)
         tk.Label(boxf, text="# presentations", anchor="w").grid(row=0, column=2, padx=6, pady=2)
+        tk.Label(boxf, text="Buzz on beam break", anchor="w").grid(row=0, column=3, padx=6, pady=2)
         for i in range(4):
             angle = i * 90
             self._passive_vars[f"box{i}_id"] = tk.StringVar()
@@ -540,10 +572,18 @@ class SMSetupDialog:
                 row=1 + i, column=1, padx=6, pady=2)
             tk.Entry(boxf, textvariable=self._passive_vars[f"box{i}_n"], width=8).grid(
                 row=1 + i, column=2, padx=6, pady=2)
+            cb = tk.Checkbutton(boxf, variable=self._passive_buzz_box_vars[i])
+            cb.grid(row=1 + i, column=3, padx=6, pady=2)
+            self._buzz_box_checks.append(cb)
         tk.Label(boxf,
                  text="(pseudorandom order — no two consecutive presentations use the same box)",
                  font=("Arial", 8), fg="gray").grid(
-            row=5, column=0, columnspan=3, sticky="w", padx=6, pady=(2, 0))
+            row=5, column=0, columnspan=4, sticky="w", padx=6, pady=(2, 0))
+        tk.Label(boxf,
+                 text="(buzz on beam break: sounds at the first table beam break of "
+                      "every presentation of that box - Buzzer mode 'On box contact' below)",
+                 font=("Arial", 8), fg="gray").grid(
+            row=6, column=0, columnspan=4, sticky="w", padx=6)
 
         # Shared duration / ITI
         self._passive_vars["duration"] = tk.StringVar()
@@ -595,6 +635,62 @@ class SMSetupDialog:
                  text="(CC delay: idle time before conditioning starts each ITI)",
                  font=("Arial", 8), fg="gray").grid(
             row=9, column=0, columnspan=4, sticky="w", padx=4)
+
+        # Buzzer sub-frame (within passive test)
+        bzf = tk.LabelFrame(self._passive_frame, text="Buzzer", padx=6, pady=4)
+        bzf.grid(row=5, column=0, columnspan=4, sticky="ew", padx=4, pady=4)
+        mf = tk.Frame(bzf)
+        mf.grid(row=0, column=0, columnspan=4, sticky="w", padx=4, pady=2)
+        for label, value in (("Off", "off"),
+                             ("During ITIs (global)", "iti"),
+                             ("On box contact", "contact")):
+            tk.Radiobutton(mf, text=label, variable=self._buzzer_mode_var, value=value,
+                           command=self._on_buzzer_mode_change).pack(side="left", padx=4)
+        self._passive_vars["buzz_freq_hz"]   = tk.StringVar(value="1000")
+        self._passive_vars["buzz_duration"]  = tk.StringVar(value="0.5")
+        self._passive_vars["buzz_iti_total"] = tk.StringVar(value="0")
+        self._buzz_entries = {}
+        for i, (label, key) in enumerate([
+            ("Frequency (Hz):",     "buzz_freq_hz"),
+            ("Duration (s):",       "buzz_duration"),
+            ("ITI buzzes (total):", "buzz_iti_total"),
+        ]):
+            tk.Label(bzf, text=label, anchor="w").grid(
+                row=1 + i, column=0, sticky="w", padx=6, pady=2)
+            e = tk.Entry(bzf, textvariable=self._passive_vars[key], width=10)
+            e.grid(row=1 + i, column=1, sticky="w", padx=6, pady=2)
+            self._buzz_entries[key] = e
+        tk.Label(bzf,
+                 text=f"(frequency {BUZZER_FREQ_MIN * BUZZER_HZ_PER_UNIT}-"
+                      f"{BUZZER_FREQ_MAX * BUZZER_HZ_PER_UNIT} Hz, in "
+                      f"{BUZZER_HZ_PER_UNIT} Hz steps. During ITIs: the total is spread "
+                      f"over the ITIs - one before each presentation except the first - "
+                      f"as evenly as possible, at random times within each ITI. "
+                      f"On box contact: at the first beam break of every presentation "
+                      f"of each box ticked above.)",
+                 font=("Arial", 8), fg="gray", wraplength=420, justify="left").grid(
+            row=4, column=0, columnspan=4, sticky="w", padx=4)
+        self._on_buzzer_mode_change()
+
+        # Continue a stopped session (see SocialMemory/resume.py). Not saved in
+        # last_settings — it applies to one run only.
+        rsf = tk.LabelFrame(self._passive_frame, text="Continue a stopped session",
+                            padx=6, pady=4)
+        rsf.grid(row=6, column=0, columnspan=4, sticky="ew", padx=4, pady=4)
+        tk.Button(rsf, text="Choose stopped session...",
+                  command=self._choose_resume).grid(row=0, column=0, sticky="w", padx=4)
+        tk.Button(rsf, text="Clear", command=self._clear_resume).grid(
+            row=0, column=1, sticky="w", padx=4)
+        self._resume_label = tk.Label(
+            rsf, text="(none - runs a new passive test with the settings above)",
+            fg="gray", justify="left", wraplength=440, anchor="w")
+        self._resume_label.grid(row=1, column=0, columnspan=4, sticky="w", padx=4, pady=(4, 0))
+        tk.Label(rsf,
+                 text="(runs only the presentations that were left, in their original "
+                      "order, into a new '..._resumed' folder; the one in progress when "
+                      "it stopped is skipped. Put the carousel at home first.)",
+                 font=("Arial", 8), fg="gray", wraplength=440, justify="left").grid(
+            row=2, column=0, columnspan=4, sticky="w", padx=4)
 
         # ── Notes ─────────────────────────────────────────────────────────────
         ttk.Separator(root, orient="horizontal").grid(
@@ -671,9 +767,44 @@ class SMSetupDialog:
             self._setup_camera_label.config(
                 text="no camera linked" if self._setup_var.get() else "")
 
+    def _on_buzzer_mode_change(self):
+        """Enable only the passive-test buzzer settings the chosen mode uses."""
+        mode = self._buzzer_mode_var.get()
+
+        def state(on):
+            return "normal" if on else "disabled"
+
+        self._buzz_entries["buzz_freq_hz"].config(state=state(mode != "off"))
+        self._buzz_entries["buzz_duration"].config(state=state(mode != "off"))
+        self._buzz_entries["buzz_iti_total"].config(state=state(mode == "iti"))
+        for cb in self._buzz_box_checks:
+            cb.config(state=state(mode == "contact"))
+
     def _on_treatment_toggle(self):
         self._treatment_entry.config(
             state="normal" if self._treatment_var.get() else "disabled")
+
+    def _choose_resume(self):
+        from SocialMemory.resume import plan_resume, describe
+        folder = filedialog.askdirectory(
+            initialdir=self._vars["save_root"].get() or os.getcwd(),
+            title="Choose the stopped passive-test session folder",
+        )
+        if not folder:
+            return
+        try:
+            plan = plan_resume(folder)
+        except ValueError as e:
+            messagebox.showerror("Cannot continue that session", str(e))
+            return
+        self._resume_folder = folder
+        self._resume_label.config(
+            text=f"{os.path.basename(folder)}\n{describe(plan)}", fg="black")
+
+    def _clear_resume(self):
+        self._resume_folder = None
+        self._resume_label.config(
+            text="(none - runs a new passive test with the settings above)", fg="gray")
 
     def _browse_save_root(self):
         chosen = filedialog.askdirectory(
@@ -734,6 +865,22 @@ class SMSetupDialog:
         except ValueError:
             errors.append("Motor speeds must be integers (0-255), or blank/'off' to leave unset.")
             door_open_speed = door_close_speed = table_speed = None
+
+        camera_fps = camera_exposure_ms = None
+        try:
+            camera_fps = float(self._vars["camera_fps"].get())
+            if not 1 <= camera_fps <= 200:
+                errors.append("Camera frame rate must be 1-200 fps.")
+        except ValueError:
+            errors.append("Camera frame rate must be a number.")
+        exp_str = self._vars["camera_exposure_ms"].get().strip()
+        if exp_str:
+            try:
+                camera_exposure_ms = float(exp_str)
+                if camera_exposure_ms <= 0:
+                    errors.append("Camera exposure must be more than 0 ms (or blank).")
+            except ValueError:
+                errors.append("Camera exposure must be a number of ms (or blank).")
 
         if mode == "training":
             ports = [p for p in ("A", "B", "C") if self._port_vars[p].get()]
@@ -875,6 +1022,24 @@ class SMSetupDialog:
                 "notes":         self._notes.get("1.0", "end").strip(),
             }
 
+        elif self._resume_folder:  # passivetest, continuing a stopped session
+            # Task settings come from the stopped session (main merges them in),
+            # so the passive fields above aren't validated or used.
+            if errors:
+                messagebox.showerror("Input Error", "\n".join(errors))
+                return
+            self.result = {
+                "mode":            "passivetest",
+                "resume_from":     self._resume_folder,
+                "save_root":       save_root,
+                "port":            port,
+                "baud":            baud,
+                "door_open_speed": door_open_speed,
+                "door_close_speed": door_close_speed,
+                "table_speed":     table_speed,
+                "notes":           self._notes.get("1.0", "end").strip(),
+            }
+
         else:  # passivetest
             cc_ports = [p for p in ("A", "B", "C") if self._passive_port_vars[p].get()]
             # Empty is allowed: no CC ports means the ITI still runs (same
@@ -926,6 +1091,54 @@ class SMSetupDialog:
             if cc_prob is not None and not (0.0 < cc_prob <= 1.0):
                 errors.append("Reward probability must be between 0 (exclusive) and 1.")
 
+            buzzer_mode = self._buzzer_mode_var.get()   # "off" | "iti" | "contact"
+            buzzer_boxes = [v.get() for v in self._passive_buzz_box_vars]
+            buzz_freq_hz = buzz_duration = buzz_iti_total = None
+            if buzzer_mode != "off":
+                try:
+                    buzz_freq_hz  = float(pv["buzz_freq_hz"].get())
+                    buzz_duration = float(pv["buzz_duration"].get())
+                except ValueError:
+                    errors.append("Buzzer frequency and duration must be numbers.")
+                    buzz_freq_hz = None
+                if buzz_freq_hz is not None:
+                    lo = BUZZER_FREQ_MIN * BUZZER_HZ_PER_UNIT
+                    hi = BUZZER_FREQ_MAX * BUZZER_HZ_PER_UNIT
+                    if not lo <= buzz_freq_hz <= hi:
+                        errors.append(f"Buzzer frequency must be {lo}-{hi} Hz.")
+                    else:
+                        # Record the frequency the firmware will actually play.
+                        buzz_freq_hz = buzzer_freq_value(buzz_freq_hz) * BUZZER_HZ_PER_UNIT
+                    if not 0 < buzz_duration <= 10:
+                        errors.append("Buzzer duration must be more than 0 and at most 10 s.")
+                        buzz_duration = None
+
+            if buzzer_mode == "iti":
+                try:
+                    buzz_iti_total = int(pv["buzz_iti_total"].get())
+                except ValueError:
+                    errors.append("ITI buzzes (total) must be a whole number.")
+                if buzz_iti_total is not None and buzz_iti_total < 1:
+                    errors.append("ITI buzzes (total) must be at least 1 "
+                                  "(or choose buzzer Off).")
+                elif buzz_iti_total is not None and box_n is not None:
+                    n_itis = sum(box_n) - 1
+                    if n_itis < 1:
+                        errors.append("ITI buzzes need at least 2 presentations "
+                                      "(there is no ITI before the first).")
+                    elif iti_min is not None and buzz_duration is not None:
+                        per_iti = -(-buzz_iti_total // n_itis)   # ceiling
+                        needed = per_iti * buzz_duration + (per_iti - 1) * BUZZ_MIN_GAP_S
+                        if needed > iti_min:
+                            errors.append(
+                                f"{buzz_iti_total} ITI buzzes over {n_itis} ITIs puts "
+                                f"up to {per_iti} in one ITI, needing {needed:.1f} s "
+                                f"(buzzes plus {BUZZ_MIN_GAP_S} s gaps) - more than "
+                                f"ITI min ({iti_min} s).")
+            elif buzzer_mode == "contact" and not any(buzzer_boxes):
+                errors.append("Buzzer is 'On box contact' but no box has "
+                              "'Buzz on beam break' ticked.")
+
             if errors:
                 messagebox.showerror("Input Error", "\n".join(errors))
                 return
@@ -953,6 +1166,13 @@ class SMSetupDialog:
                 "cc_reward_prob":  cc_prob,
                 "cc_delay":        cc_delay,
                 "valve_times":     {"A": valve_time_A, "B": valve_time_B, "C": valve_time_C},
+                "buzzer_mode":     buzzer_mode,
+                "buzzer_enabled":  buzzer_mode != "off",
+                "buzzer_freq_hz":  buzz_freq_hz,
+                "buzzer_duration": buzz_duration,
+                "buzzer_iti_total": buzz_iti_total if buzzer_mode == "iti" else 0,
+                "buzzer_boxes":    (buzzer_boxes if buzzer_mode == "contact"
+                                    else [False] * 4),
                 "notes":           self._notes.get("1.0", "end").strip(),
             }
 
@@ -973,6 +1193,8 @@ class SMSetupDialog:
         self.result["treatment_details"]  = treatment_details
         self.result["record_camera"] = self._camera.record
         self.result["camera_serial"] = self._camera.serial
+        self.result["camera_fps"] = camera_fps
+        self.result["camera_exposure_ms"] = camera_exposure_ms
         self.result["show_sensor_display"] = self._sensor_display_var.get()
 
         self._update_history()

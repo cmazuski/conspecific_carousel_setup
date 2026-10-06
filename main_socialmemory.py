@@ -23,7 +23,8 @@ from datetime import datetime
 from serial_comm import DeviceConnection
 from hardware import (
     SharedSensorState, EventLogger, CameraTriggerLogger, STOP_EVENT, shutdown_outputs,
-    turn_table_degrees, apply_motor_speeds,
+    turn_table_degrees, apply_motor_speeds, buzzer_off,
+    board_responds, BoardWatchdog, BOARD_DEAD_MESSAGE,
 )
 from SocialMemory.setup_dialog import SMSetupDialog
 
@@ -79,6 +80,27 @@ def _save_metadata(save_dir, params):
     print(f"[INFO] Metadata saved: {path}")
 
 
+def _record_board_failure(save_dir, session_start, reason, silent_since):
+    """Add a "board_failure" entry to the session's metadata.json, so a run cut
+    short by a dead board is identifiable afterwards. Times are relative to
+    session_start, like every other file in the folder."""
+    path = os.path.join(save_dir, "metadata.json")
+    try:
+        with open(path) as f:
+            meta = json.load(f)
+        meta["board_failure"] = {
+            "reason": reason,
+            "last_data_from_board_s": (None if silent_since is None
+                                       else round(silent_since - session_start, 3)),
+            "detected_at_s": round(time.time() - session_start, 3),
+        }
+        with open(path, "w") as f:
+            json.dump(meta, f, indent=2, default=str)
+        print(f"[INFO] Board failure noted in {path}")
+    except Exception as e:
+        print(f"[WARN] Could not note the board failure in metadata.json: {e}")
+
+
 # How long to wait after launching cameracontrol before checking that it's
 # still alive. Catches fast-fail startup errors (ffmpeg missing, no camera
 # device found) that happen well before the first frame is grabbed — long
@@ -88,7 +110,8 @@ CAMERA_STARTUP_CHECK_S = 2.0
 
 
 def _start_camera_recording(session_start: float, save_dir: str,
-                            camera: str = ""):
+                            camera: str = "", fps: float = None,
+                            exposure_ms: float = None):
     """Launch cameracontrol as a background subprocess, sharing this session's
     clock (so its frame_timestamps.csv lines up with sensor_events.csv etc.)
     and writing directly into this session's save folder. Returns the Popen
@@ -96,7 +119,10 @@ def _start_camera_recording(session_start: float, save_dir: str,
     behavioral session continues without video).
 
     `camera` is the serial number picked in the setup GUI; blank means "first
-    camera found" (the only sensible choice with a single camera attached)."""
+    camera found" (the only sensible choice with a single camera attached).
+    `fps` / `exposure_ms` are passed through (None = cameracontrol's default
+    30 fps / the camera's own exposure); cameracontrol prints a warning if the
+    camera can't reach the rate with that exposure and crop."""
     if shutil.which("ffmpeg") is None:
         print("[WARN] Could not start camera recording: ffmpeg not found on PATH. "
               "cameracontrol now encodes video through ffmpeg (see its module "
@@ -118,6 +144,10 @@ def _start_camera_recording(session_start: float, save_dir: str,
                "--crop", "reuse"]
         if camera:
             cmd += ["--camera", camera]
+        if fps:
+            cmd += ["--fps", str(fps)]
+        if exposure_ms:
+            cmd += ["--exposure-ms", str(exposure_ms)]
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -236,6 +266,22 @@ def main():
         print("[INFO] Setup cancelled.")
         return
 
+    # Continuation of a stopped passive test: task settings come from that
+    # session, rig/runtime settings from this dialog (see SocialMemory/resume.py).
+    resume_plan = None
+    if params.get("resume_from"):
+        from SocialMemory.resume import plan_resume, merge_params
+        try:
+            resume_plan = plan_resume(params["resume_from"])
+        except ValueError as e:
+            print(f"[ERROR] Cannot continue {params['resume_from']}: {e}")
+            return
+        params = merge_params(resume_plan, params)
+        print(f"[INFO] Continuing {os.path.basename(params['resume_from'])}: "
+              f"{len(resume_plan['completed'])} done, skipping "
+              f"{resume_plan['skipped'] or 'none'}, running "
+              f"{', '.join(resume_plan['remaining_labels'])}")
+
     mode      = params["mode"]
     species   = params["species"]
     animal    = params["animal"]
@@ -261,7 +307,8 @@ def main():
     save_root = params.get("save_root") or "SocialMemoryData" 
     BASE_SAVE_DIR = os.path.join(
         save_root,
-        f"{animal}_{session_n}_{mode}_{species}_{timestamp_str}",
+        f"{animal}_{session_n}_{mode}_{species}_{timestamp_str}"
+        + ("_resumed" if resume_plan else ""),
     )
     os.makedirs(BASE_SAVE_DIR, exist_ok=True)
     print(f"[INFO] Saving to: {BASE_SAVE_DIR}")
@@ -274,6 +321,20 @@ def main():
         from SocialMemory.base_session import REWARD_INCREMENT_S, REWARD_MAX_VALVE_S
         params["reward_increment_s"] = REWARD_INCREMENT_S
         params["reward_max_valve_s"] = REWARD_MAX_VALVE_S
+
+    # Passive test: fix the presentation order now and save it in the metadata,
+    # so a session that is cut short can be continued (SocialMemory/resume.py).
+    passive_sequence = passive_labels = None
+    if mode == "passivetest":
+        if resume_plan:
+            passive_sequence = resume_plan["remaining"]
+            passive_labels = resume_plan["remaining_labels"]
+        else:
+            passive_sequence = generate_box_sequence(
+                {i: params["box_n"][i] for i in range(4)})
+            passive_labels = label_sequence(passive_sequence)
+        params["sequence"] = passive_sequence
+        params["sequence_labels"] = passive_labels
     _save_metadata(BASE_SAVE_DIR, params)
 
     sensor_log   = os.path.join(BASE_SAVE_DIR, "sensor_events.csv")
@@ -286,7 +347,9 @@ def main():
     camera_proc = None
     if params.get("record_camera", True):
         camera_proc = _start_camera_recording(
-            session_start, BASE_SAVE_DIR, params.get("camera_serial", ""))
+            session_start, BASE_SAVE_DIR, params.get("camera_serial", ""),
+            fps=params.get("camera_fps"),
+            exposure_ms=params.get("camera_exposure_ms"))
     else:
         print("[INFO] Camera recording disabled (not checked in setup)")
 
@@ -300,12 +363,26 @@ def main():
         _stop_camera_recording(camera_proc)
         return
 
-    apply_motor_speeds(
-        device,
-        door_open_speed=params.get("door_open_speed"),
-        door_close_speed=params.get("door_close_speed"),
-        table_speed=params.get("table_speed"),
-    )
+    # The port can open fine while the board's firmware is stuck (it stays on
+    # USB after a firmware hang) — check it actually answers before starting,
+    # instead of crashing on the first command with the camera left running.
+    try:
+        if not board_responds(device):
+            raise TimeoutError("no answer to a status read")
+        apply_motor_speeds(
+            device,
+            door_open_speed=params.get("door_open_speed"),
+            door_close_speed=params.get("door_close_speed"),
+            table_speed=params.get("table_speed"),
+        )
+    except Exception as e:
+        print(f"\n[ERROR] Board on {port} is not responding ({e}).")
+        print(f"[ERROR] {BOARD_DEAD_MESSAGE}\n")
+        _record_board_failure(BASE_SAVE_DIR, session_start,
+                              f"not responding at startup ({e})", None)
+        device.disconnect()
+        _stop_camera_recording(camera_proc)
+        return
 
     # ── Shared state + event logger ───────────────────────────────────────────
     shared = SharedSensorState()
@@ -346,22 +423,24 @@ def main():
         print("[INFO] Live sensor display off (not checked in setup)")
     box_labels = None
     expected_periods = None
-    passive_sequence = None
     if mode == "task":
         expected_periods = ([f"S1_{i + 1}" for i in range(params["s1_n"])]
                              + [f"S2_{i + 1}" for i in range(params["s2_n"])])
     elif mode == "passivetest":
         box_labels = {i: params["box_ids"][i] for i in range(4)}
-        passive_sequence = generate_box_sequence(
-            {i: params["box_n"][i] for i in range(4)}
-        )
-        expected_periods = label_sequence(passive_sequence)
+        expected_periods = passive_labels
 
     perf_gui = PerformanceGUI(animal_name=animal, mode=mode,
                                stim1_id=params.get("s1_id"), stim2_id=params.get("s2_id"),
                                box_labels=box_labels, expected_periods=expected_periods)
 
     session = None
+
+    # Ends the session within seconds if the board stops responding (see
+    # hardware.BoardWatchdog): STOP_EVENT stops the session and GUI loops, and
+    # the shutdown below skips everything that needs the board.
+    watchdog = BoardWatchdog(device, on_dead=STOP_EVENT.set)
+    watchdog.start()
 
     # ── Run session ───────────────────────────────────────────────────────────
     try:
@@ -454,7 +533,15 @@ def main():
                 cc_reward_prob=params["cc_reward_prob"],
                 cc_delay=params.get("cc_delay", 0.0),
                 sequence=passive_sequence,
+                period_labels=passive_labels,
+                first_presentation_num=(resume_plan["first_presentation_num"]
+                                        if resume_plan else 1),
                 session_start=session_start,
+                buzzer_freq_hz=(params["buzzer_freq_hz"]
+                                if params.get("buzzer_enabled") else None),
+                buzzer_duration=params.get("buzzer_duration") or 0.0,
+                buzzer_iti_total=params.get("buzzer_iti_total") or 0,
+                buzzer_boxes=params.get("buzzer_boxes"),
             )
             door_override = threading.Event()
             session.door_override = door_override
@@ -472,29 +559,71 @@ def main():
     finally:
         print("[INFO] Shutting down...")
         STOP_EVENT.set()
+        # Stop watching first: the disconnect below would otherwise look like
+        # a dead board.
+        watchdog.stop()
+
+        def _step(label, fn):
+            """Run one shutdown step; a failure is printed and the rest still
+            run. Before this, one unanswered command (a dead board) aborted the
+            whole shutdown - no performance.png, camera not stopped cleanly."""
+            try:
+                fn()
+            except Exception as e:
+                print(f"[WARN] Shutdown: {label} failed: {e}")
 
         if session is not None:
             session.stop_internal()
 
             if mode == "training":
-                csv_path = os.path.join(BASE_SAVE_DIR, "trials.csv")
-                session.results_df.to_csv(csv_path, index=False, float_format="%.3f")
-                print(f"[INFO] Trials saved: {csv_path}")
+                def _save_training():
+                    csv_path = os.path.join(BASE_SAVE_DIR, "trials.csv")
+                    session.results_df.to_csv(csv_path, index=False, float_format="%.3f")
+                    print(f"[INFO] Trials saved: {csv_path}")
+                _step("saving trials.csv", _save_training)
                 # Final GUI update
-                perf_gui.update(session.snapshot(session.results_df))
+                _step("final performance update",
+                      lambda: perf_gui.update(session.snapshot(session.results_df)))
 
             elif mode in ("task", "passivetest"):
-                pres_path = os.path.join(BASE_SAVE_DIR, "presentations.csv")
-                cc_path   = os.path.join(BASE_SAVE_DIR, "conditioning_trials.csv")
-                session.presentations_df.to_csv(pres_path, index=False, float_format="%.3f")
-                session.conditioning_df.to_csv(cc_path, index=False, float_format="%.3f")
-                print(f"[INFO] Presentations saved: {pres_path}")
-                print(f"[INFO] Conditioning trials saved: {cc_path}")
-                perf_gui.update(session.snapshot(session.presentations_df),
-                                 session.snapshot(session.conditioning_df))
+                def _save_task():
+                    pres_path = os.path.join(BASE_SAVE_DIR, "presentations.csv")
+                    cc_path   = os.path.join(BASE_SAVE_DIR, "conditioning_trials.csv")
+                    session.presentations_df.to_csv(pres_path, index=False, float_format="%.3f")
+                    session.conditioning_df.to_csv(cc_path, index=False, float_format="%.3f")
+                    print(f"[INFO] Presentations saved: {pres_path}")
+                    print(f"[INFO] Conditioning trials saved: {cc_path}")
+                    # Only when the buzzer was on, so buzzer-free sessions keep
+                    # exactly the files they always had.
+                    if params.get("buzzer_enabled"):
+                        buzz_path = os.path.join(BASE_SAVE_DIR, "buzzer_events.csv")
+                        session.buzzer_df.to_csv(buzz_path, index=False, float_format="%.3f")
+                        print(f"[INFO] Buzzer events saved: {buzz_path}")
+                _step("saving results", _save_task)
+                _step("final performance update",
+                      lambda: perf_gui.update(session.snapshot(session.presentations_df),
+                                              session.snapshot(session.conditioning_df)))
+
+        # The session can hit a dead board before the watchdog does (its next
+        # command times out first) — so if the board has gone quiet, check it
+        # once more before sending it the shutdown commands.
+        if not watchdog.dead.is_set() and device.last_rx_age > 2.0:
+            if not board_responds(device):
+                watchdog.declare("it stopped answering commands")
+        board_dead = watchdog.dead.is_set()
+
+        if board_dead:
+            _step("noting the board failure",
+                  lambda: _record_board_failure(BASE_SAVE_DIR, session_start,
+                                                watchdog.reason, watchdog.silent_since))
+            # Every command would just time out (3 s each); the turntable and
+            # outputs are wherever the board left them.
+            print("[WARN] Board not responding - skipped turntable home return and "
+                  "switching outputs off. Check the rig: the turntable may not be "
+                  "at home and a valve/LED may still be on until the board is reset.")
 
         # Return turntable to home after task/passivetest (both use the turntable)
-        if mode in ("task", "passivetest") and session is not None:
+        elif mode in ("task", "passivetest") and session is not None:
             try:
                 def _poll_stopped(timeout=20.0):
                     time.sleep(1.0)
@@ -520,14 +649,22 @@ def main():
                 print(f"[WARN] Home return failed: {e}")
 
         if sensor_gui is not None:
-            sensor_gui.update(shared.get())
-        shutdown_outputs(device)
-        device.disconnect()
-        perf_gui.close(save_path=perf_fig)
+            _step("sensor display update", lambda: sensor_gui.update(shared.get()))
+        if not board_dead:
+            if params.get("buzzer_enabled"):
+                # Not in shutdown_outputs: firmware without a buzzer wouldn't ACK it.
+                _step("switching the buzzer off", lambda: buzzer_off(device))
+            _step("switching outputs off", lambda: shutdown_outputs(device))
+        _step("disconnecting", device.disconnect)
+        _step("saving performance.png", lambda: perf_gui.close(save_path=perf_fig))
         if sensor_gui is not None:
-            sensor_gui.close()
-        _stop_camera_recording(camera_proc)
-        print("[INFO] Clean shutdown complete")
+            _step("closing the sensor display", sensor_gui.close)
+        _step("stopping the camera", lambda: _stop_camera_recording(camera_proc))
+        if board_dead:
+            print("[INFO] Shutdown complete - session ended early: board not responding. "
+                  + BOARD_DEAD_MESSAGE)
+        else:
+            print("[INFO] Clean shutdown complete")
 
 
 if __name__ == "__main__":

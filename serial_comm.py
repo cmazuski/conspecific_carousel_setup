@@ -34,6 +34,9 @@ class DeviceConnection:
 
         self._reader_alive = False
         self._last_error_print = 0.0
+        # time.monotonic() of the last complete packet (ACK or EVENT) from the
+        # board; None until the first one. Lets a watchdog tell "quiet" from "dead".
+        self._last_rx = None
 
     # ---- lifecycle ----
 
@@ -68,6 +71,14 @@ class DeviceConnection:
         stopped.
         """
         return self._reader_alive
+
+    @property
+    def last_rx_age(self):
+        """Seconds since the board last sent a complete packet (ACK or EVENT);
+        infinity if it never has."""
+        if self._last_rx is None:
+            return float("inf")
+        return time.monotonic() - self._last_rx
 
     # ---- callback registration ----
 
@@ -120,6 +131,11 @@ class DeviceConnection:
                 pass
 
     def _send_with_retry(self, packet, register):
+        if self._serial is None:
+            # A background helper thread can still be trying to talk to the
+            # board after shutdown has closed the port — say so plainly.
+            raise ConnectionError(
+                f"Not connected (port closed) - cannot send to register 0x{register:02X}")
         with self._lock:
             # drain stale ACKs
             while not self._ack_queue.empty():
@@ -171,6 +187,7 @@ class DeviceConnection:
                         continue
 
                     register, msg_type, value = result
+                    self._last_rx = time.monotonic()
                     if msg_type == MSG_ACK:
                         self._ack_queue.put((register, value))
                         for cb in self._ack_callbacks:

@@ -140,6 +140,11 @@ class SocialMemoryTaskSession(BaseSMSession):
                     break
                 self._run_presentation(self.s2_angle, self.s2_duration, f"S2_{i + 1}")
 
+        except TimeoutError as e:
+            # The board stopped answering commands. One clear line instead of a
+            # traceback; main's shutdown checks the board and saves everything.
+            print(f"[ERROR] {self._session_name}: the board did not answer a "
+                  f"command ({e}) - ending the session")
         finally:
             self.running = False
             print(f"[INFO] {self._session_name} ended")

@@ -134,6 +134,15 @@ Every run creates one folder, `<save_root>/<animal>_<session_n>_<phase>_<YYYY-MM
 - `performance.png` — the final performance figure.
 - `recording_<timestamp>.mp4` + `frame_timestamps.csv` + `camera_sync.csv` — video and its two
   timebases.
+- SocialMemory passive tests save their planned order in `metadata.json` (`sequence`,
+  `sequence_labels`), so a stopped one can be continued: "Continue a stopped session" in the
+  setup dialog (`SocialMemory/resume.py`) runs the remaining presentations — skipping the one in
+  progress, detected by a `door opened` after the last completed presentation — into a separate
+  `..._resumed` folder with its own clock, keeping the original labels and `presentation_num`,
+  and recording `resume_from` / `resume_plan`. The folders are merged offline, not by this code.
+- `buzzer_events.csv` — SocialMemory passive test only, and only when its buzzer is on: one row
+  per buzz (`trigger` = `iti` or `contact`, host-side `t_on`/`t_off`). The firmware sends no
+  buzzer events, so these are the only record of when it sounded.
 
 **Everything shares one `t=0`**: `main_*.py` captures `session_start = time.time()` and passes it
 to the `EventLogger`, the `CameraTriggerLogger`, and (via `--session-start`) the camera subprocess.
@@ -164,6 +173,12 @@ adding a column to a results DataFrame does not break replay of old sessions.
 - `camera_select.py` builds the setup dialogs' camera dropdown by shelling out to
   `cameracontrol.py --list-cameras`, keeping `pypylon` out of the Tk process.
 - Cropping sets the camera's sensor ROI (`Width/Height/OffsetX/OffsetY`), not a software crop.
+- **Frame rate is written to the camera every run** (`--fps`, default 30; SocialMemory's dialog
+  passes its own, plus optional `--exposure-ms`), after cropping, and the rate the camera reports
+  it can achieve is what the MP4 is stamped with. On the acA1920-40uc cameras, exposure and crop
+  height cap it: 30 ms exposure -> 33 fps max; 1210 rows -> ~41, 1000 -> ~50, 800 -> 60. The TTL
+  pulse fires every `round(fps)` frames (~1 Hz) from its own thread — inline, its 10 ms sleep
+  dropped frames at 60 fps.
 - Frames are piped to real `ffmpeg`/libx264 rather than `cv2.VideoWriter`, because only that gives
   real control over quality via CRF.
 - Two different camera timebases: `frame_timestamps.csv` is per-frame; `camera_sync.csv` records a
@@ -181,6 +196,14 @@ These encode failures already debugged on the rig — preserve them.
   periodic **resync** (re-read the status register directly — `resync_door_state`,
   `resync_table_motor_state`) and a **bounded timeout plus `WaitHeartbeat`** progress lines. Any new
   blocking wait must have both. Never write an unbounded wait on device state.
+- **The board's firmware can hang while staying on USB** (seen twice on 2026-09-28: all events
+  stop, no ACKs, only an unplug/replug recovers it; Windows logs no USB removal at the hang).
+  `main_socialmemory.py` guards against it: `board_responds` at startup, a `BoardWatchdog`
+  (`hardware.py`) that pings after 5 s of silence and sets `STOP_EVENT` if the board doesn't
+  answer, and a shutdown where every step is isolated (`_step`) and board commands are skipped
+  once it's dead — so all files and `performance.png` are still saved, and `metadata.json` gets a
+  `board_failure` entry. The likely firmware cause (`asyncio.Event.set()` from a hard IRQ in the
+  firmware's `utility.EventPin`) is not fixed yet. Other families don't have the watchdog yet.
 - **Recovery-path `print()`s must be ASCII only** (`->`, not `→`). These lines fire on a cp1252
   Windows console, and a `UnicodeEncodeError` there turns the recovery into the crash it exists to
   prevent.

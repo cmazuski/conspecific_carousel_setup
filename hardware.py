@@ -24,7 +24,8 @@ from protocol import (
     REG_DOOR_OPN_SPD, REG_DOOR_CLS_SPD,
     REG_TABLE_STATUS, REG_TABLE_CMD, REG_TABLE_SPD,
     REG_CAM_A, REG_CAM_B,
-    build_table_command,
+    REG_BZR_EN, REG_BZR_FREQ,
+    build_table_command, buzzer_freq_value,
 )
 from serial_comm import DeviceConnection
 from utils import now
@@ -392,6 +393,29 @@ def incremental_reward(
 
 def set_led(device: DeviceConnection, port: str, on: bool) -> None:
     device.write_register(PORT_REGS[port]["led"], 1 if on else 0)
+
+
+def sound_buzzer(device: DeviceConnection, freq_hz: float,
+                 duration: float) -> Tuple[float, float]:
+    """Sound the buzzer at freq_hz (rounded to the firmware's 20 Hz steps) for
+    `duration` s, then switch it off — always, even if interrupted, so it can't
+    be left sounding. Cut short if STOP_EVENT is set. Blocks; returns the
+    time.time() it went on and off. Needs firmware with the buzzer registers
+    (older builds don't ACK them, raising TimeoutError)."""
+    device.write_register(REG_BZR_FREQ, buzzer_freq_value(freq_hz))
+    device.write_register(REG_BZR_EN, 1)
+    t_on = time.time()
+    try:
+        end = t_on + duration
+        while time.time() < end and not STOP_EVENT.is_set():
+            time.sleep(0.005)
+    finally:
+        device.write_register(REG_BZR_EN, 0)
+    return t_on, time.time()
+
+
+def buzzer_off(device: DeviceConnection) -> None:
+    device.write_register(REG_BZR_EN, 0)
 
 
 def sensor_held(shared: SharedSensorState, port: str) -> bool:
@@ -902,3 +926,97 @@ def wait_for_door_and_table_clear(shared: SharedSensorState) -> bool:
             clear_start = None
         heartbeat.tick()
         time.sleep(0.01)
+
+
+# ── Board liveness ────────────────────────────────────────────────────────────
+#
+# The board's firmware can stop responding mid-session while staying connected
+# on USB (seen on the rig: all events stop, no ACKs, recovers only after an
+# unplug/replug). Nothing else notices until the next command times out, which
+# can be a minute later, mid-presentation. These let a session detect it within
+# seconds and end cleanly instead of crashing half-way through shutdown.
+
+BOARD_DEAD_MESSAGE = (
+    "Unplug the board's USB cable and plug it back in (or power-cycle it), "
+    "then start a new session.")
+
+
+def board_responds(device: DeviceConnection) -> bool:
+    """True if the board answers a status read (the door-status register — any
+    firmware that sends events answers it). Takes up to ~3 s when it doesn't."""
+    try:
+        device.read_register(REG_DOOR_STATUS)
+        return True
+    except Exception:
+        return False
+
+
+class BoardWatchdog:
+    """Background thread that declares the board dead when it has sent nothing
+    for `silence_s` seconds AND then fails to answer a status read (a board with
+    nothing to report is quiet but still answers; with the camera recording, its
+    ~1 Hz sync pulses keep the link busy anyway). Also fires if the serial
+    reader thread dies (the COM port itself failed).
+
+    On death: sets `dead`, records `silent_since` (time.time() of the board's
+    last packet), prints an ASCII-only message (this runs on a cp1252 console),
+    and calls on_dead() — e.g. STOP_EVENT.set to end the session.
+    """
+
+    def __init__(self, device: DeviceConnection, silence_s: float = 5.0,
+                 on_dead=None):
+        self._device = device
+        self._silence_s = silence_s
+        self._on_dead = on_dead
+        self._stop = threading.Event()
+        self._thread = None
+        self.dead = threading.Event()
+        self.silent_since = None
+        self.reason = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop watching (call before a deliberate disconnect, which would
+        otherwise look like a dead board)."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(1.0):
+            if not self._device.is_reader_alive:
+                self.declare("the serial port stopped working (reader thread exited)")
+                return
+            age = self._device.last_rx_age
+            if age < self._silence_s:
+                continue
+            # A failed check counts even if stop() was called meanwhile — the
+            # board really didn't answer, and shutdown needs to know.
+            if board_responds(self._device):
+                continue
+            self.declare(f"nothing received for {self._device.last_rx_age:.0f} s "
+                          f"and no answer to a status read")
+            return
+
+    def declare(self, reason: str) -> None:
+        """Mark the board dead (also usable by callers that found out first,
+        e.g. a command that got no ACK)."""
+        if self.dead.is_set():
+            return
+        age = self._device.last_rx_age
+        self.silent_since = time.time() - age if age != float("inf") else None
+        self.reason = reason
+        self.dead.set()
+        print("\n" + "!" * 72)
+        print(f"[ERROR] BOARD NOT RESPONDING: {reason}.")
+        print(f"[ERROR] {BOARD_DEAD_MESSAGE}")
+        print("[ERROR] Ending this session and saving everything recorded so far.")
+        print("!" * 72 + "\n")
+        if self._on_dead is not None:
+            try:
+                self._on_dead()
+            except Exception as e:
+                print(f"[ERROR] Board watchdog callback failed: {e}")
